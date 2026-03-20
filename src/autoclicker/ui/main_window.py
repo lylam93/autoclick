@@ -49,6 +49,7 @@ class MainWindow(QMainWindow):
         self._click_engine = click_engine
         self._hotkey_service = hotkey_service
         self._config = self._config_store.load()
+        self._pending_config_message = self._config_store.last_message
         self._discovered_windows: dict[int, TargetWindow] = {}
         self._hotkey_bridge = HotkeyBridge(self)
         self._last_terminal_message = self._click_engine.status.last_message
@@ -63,6 +64,8 @@ class MainWindow(QMainWindow):
         self._wire_events()
         self._start_status_timer()
         self._append_log("Python + PySide6 scaffold is ready.")
+        if self._pending_config_message:
+            self._append_log(self._pending_config_message)
         self._sync_runtime_status()
         self._sync_action_states()
         self._apply_hotkeys(log_success=True)
@@ -104,7 +107,7 @@ class MainWindow(QMainWindow):
         title.setStyleSheet("font-size: 22pt; font-weight: 700; color: #f7d9aa;")
 
         subtitle = QLabel(
-            "Step 7: the UI now exposes mouse button and delivery mode controls, plus a working crosshair picker that can grab the target window directly from the cursor."
+            "Step 8: settings now persist through a versioned config.json file, while the UI still exposes delivery controls and the crosshair picker from the earlier step."
         )
         subtitle.setProperty("role", "muted")
         subtitle.setWordWrap(True)
@@ -451,9 +454,8 @@ class MainWindow(QMainWindow):
 
     def _handle_save_config(self) -> None:
         self._update_config_from_form()
-        self._config_store.save(self._config)
-        self._append_log(f"Configuration saved to {self._config_store.path}.")
-        self._apply_hotkeys(log_success=True)
+        if self._save_config(log_to_ui=True):
+            self._apply_hotkeys(log_success=True)
 
     def _handle_test_background_click(self) -> None:
         if self._pick_window_pending:
@@ -558,6 +560,20 @@ class MainWindow(QMainWindow):
 
         self._append_log(result.message)
         return result.success
+
+    def _save_config(self, *, log_to_ui: bool) -> bool:
+        try:
+            self._config_store.save(self._config)
+        except OSError as exc:
+            if log_to_ui:
+                self._append_log(
+                    f"Could not save configuration to {self._config_store.path.resolve()} ({exc})."
+                )
+            return False
+
+        if log_to_ui and self._config_store.last_message:
+            self._append_log(self._config_store.last_message)
+        return True
 
     def _set_target_window(self, target_window: TargetWindow) -> None:
         self._config.target_window = replace(target_window)
@@ -732,6 +748,13 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self._status_timer.stop()
-        self._hotkey_service.unregister()
+        self._update_config_from_form()
         self._click_engine.stop()
+        self._hotkey_service.unregister()
+        try:
+            self._config_store.save(self._config)
+        except OSError:
+            pass
         super().closeEvent(event)
+
+
