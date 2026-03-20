@@ -1,4 +1,6 @@
-from __future__ import annotations
+﻿from __future__ import annotations
+
+from dataclasses import replace
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
@@ -9,6 +11,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QPlainTextEdit,
     QPushButton,
@@ -17,7 +20,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from autoclicker.domain.models import AppConfig
+from autoclicker.domain.models import AppConfig, TargetWindow
 from autoclicker.services.click_engine import ClickEngine
 from autoclicker.services.config_store import ConfigStore
 from autoclicker.services.hotkey_service import HotkeyService
@@ -39,6 +42,7 @@ class MainWindow(QMainWindow):
         self._click_engine = click_engine
         self._hotkey_service = hotkey_service
         self._config = self._config_store.load()
+        self._discovered_windows: dict[int, TargetWindow] = {}
 
         self.setWindowTitle("Advanced Background Auto-Clicker")
         self.resize(1080, 760)
@@ -48,6 +52,7 @@ class MainWindow(QMainWindow):
         self._populate_from_config(self._config)
         self._wire_events()
         self._append_log("Python + PySide6 scaffold is ready.")
+        self._handle_refresh_windows()
 
     def _build_ui(self) -> None:
         root = QWidget(self)
@@ -85,7 +90,7 @@ class MainWindow(QMainWindow):
         title.setStyleSheet("font-size: 22pt; font-weight: 700; color: #f7d9aa;")
 
         subtitle = QLabel(
-            "Step 1 scaffold: app shell, service boundaries, and a UI ready for Win32 integration."
+            "Step 2: Win32 window discovery and target selection are wired in. Background click delivery is next."
         )
         subtitle.setProperty("role", "muted")
         subtitle.setWordWrap(True)
@@ -106,13 +111,16 @@ class MainWindow(QMainWindow):
         self.target_meta_value.setProperty("role", "muted")
 
         self.window_list = QListWidget()
-        self.window_list.addItem("Window enumeration will appear here in Step 2.")
+        self.window_list.setAlternatingRowColors(True)
 
         buttons = QHBoxLayout()
         self.refresh_windows_button = QPushButton("Refresh Windows")
+        self.use_selected_window_button = QPushButton("Use Selected")
+        self.use_selected_window_button.setEnabled(False)
         self.pick_window_button = QPushButton("Crosshair Picker")
         self.pick_window_button.setEnabled(False)
         buttons.addWidget(self.refresh_windows_button)
+        buttons.addWidget(self.use_selected_window_button)
         buttons.addWidget(self.pick_window_button)
 
         layout.addWidget(self.target_title_value)
@@ -237,21 +245,67 @@ class MainWindow(QMainWindow):
 
     def _wire_events(self) -> None:
         self.refresh_windows_button.clicked.connect(self._handle_refresh_windows)
+        self.use_selected_window_button.clicked.connect(self._handle_apply_selected_window)
+        self.window_list.currentItemChanged.connect(self._handle_window_selection_changed)
+        self.window_list.itemDoubleClicked.connect(self._handle_window_item_double_clicked)
         self.save_config_button.clicked.connect(self._handle_save_config)
         self.start_button.clicked.connect(self._handle_start)
         self.stop_button.clicked.connect(self._handle_stop)
 
     def _handle_refresh_windows(self) -> None:
         windows = self._window_service.list_windows()
+        self._discovered_windows = {window.hwnd: window for window in windows if window.hwnd is not None}
         self.window_list.clear()
 
         if not windows:
-            self.window_list.addItem("No windows are listed yet. Step 2 will add Win32 enumeration.")
-            self._append_log("Refresh requested. Window enumeration is not implemented yet.")
+            self.window_list.addItem("No visible titled windows were found.")
+            self.use_selected_window_button.setEnabled(False)
+            self._append_log("Refresh complete. No visible titled windows were found.")
             return
 
+        selected_hwnd = self._config.target_window.hwnd
+        selected_item: QListWidgetItem | None = None
+
         for window in windows:
-            self.window_list.addItem(f"{window.title} [HWND={window.hwnd}]")
+            item = QListWidgetItem(self._format_window_item(window))
+            item.setData(Qt.ItemDataRole.UserRole, window)
+            self.window_list.addItem(item)
+
+            if selected_hwnd and window.hwnd == selected_hwnd:
+                selected_item = item
+
+        if selected_item is not None:
+            self.window_list.setCurrentItem(selected_item)
+
+        self._append_log(f"Refresh complete. Found {len(windows)} visible titled windows.")
+
+    def _handle_window_selection_changed(
+        self,
+        current: QListWidgetItem | None,
+        _previous: QListWidgetItem | None,
+    ) -> None:
+        has_selection = current is not None and current.data(Qt.ItemDataRole.UserRole) is not None
+        self.use_selected_window_button.setEnabled(has_selection)
+
+    def _handle_window_item_double_clicked(self, _item: QListWidgetItem) -> None:
+        self._handle_apply_selected_window()
+
+    def _handle_apply_selected_window(self) -> None:
+        item = self.window_list.currentItem()
+        if item is None:
+            self._append_log("Select a window first.")
+            return
+
+        selected_window = item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(selected_window, TargetWindow):
+            self._append_log("The selected row does not contain a valid window target.")
+            return
+
+        self._set_target_window(selected_window)
+        self._append_log(
+            f"Selected target window: {selected_window.title} "
+            f"(HWND={selected_window.hwnd}, Class={selected_window.class_name or '-'})"
+        )
 
     def _handle_save_config(self) -> None:
         self._config.click_settings.delay_ms = self.delay_spin.value()
@@ -281,3 +335,22 @@ class MainWindow(QMainWindow):
 
     def _append_log(self, message: str) -> None:
         self.log_output.appendPlainText(message)
+
+    def _set_target_window(self, target_window: TargetWindow) -> None:
+        self._config.target_window = replace(target_window)
+        self.target_title_value.setText(target_window.title or "Selected target")
+        self.target_meta_value.setText(
+            f"HWND: {target_window.hwnd or '-'}, "
+            f"Class: {target_window.class_name or '-'}, "
+            f"PID: {target_window.process_id or '-'}"
+        )
+
+    def _format_window_item(self, target_window: TargetWindow) -> str:
+        class_name = target_window.class_name or "UnknownClass"
+        process_id = target_window.process_id if target_window.process_id is not None else "-"
+        return (
+            f"{target_window.title} | "
+            f"Class={class_name} | "
+            f"PID={process_id} | "
+            f"HWND={target_window.hwnd}"
+        )
