@@ -107,7 +107,7 @@ class MainWindow(QMainWindow):
         title.setStyleSheet("font-size: 22pt; font-weight: 700; color: #f7d9aa;")
 
         subtitle = QLabel(
-            "Step 8: settings now persist through a versioned config.json file, while the UI still exposes delivery controls and the crosshair picker from the earlier step."
+            "Step 9: the MVP now adds versioned persistence, runtime packaging support, and the delivery controls and crosshair picker from the earlier steps."
         )
         subtitle.setProperty("role", "muted")
         subtitle.setWordWrap(True)
@@ -756,5 +756,6 @@ class MainWindow(QMainWindow):
         except OSError:
             pass
         super().closeEvent(event)
+
 
 

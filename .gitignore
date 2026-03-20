@@ -1,4 +1,4 @@
-.venv/
+﻿.venv/
 __pycache__/
 *.py[cod]
 *.pyd
@@ -11,5 +11,7 @@ dist/
 *.egg-info/
 .idea/
 .vscode/
+.codex-temp/
+.test-temp/
+logs/
 config.json
-

@@ -1,4 +1,4 @@
-[build-system]
+﻿[build-system]
 requires = ["setuptools>=69", "wheel"]
 build-backend = "setuptools.build_meta"
 
@@ -10,11 +10,12 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "PySide6>=6.7,<7",
-    "pywin32>=306",
-    "keyboard>=0.13.5",
 ]
 
 [project.optional-dependencies]
+build = [
+    "pyinstaller>=6.10",
+]
 dev = [
     "pytest>=8.0",
 ]
@@ -27,4 +28,3 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
-
