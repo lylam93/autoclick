@@ -9,14 +9,25 @@
 
 ## Install
 
+Recommended, because this workspace blocks `pip` from using the default temp folder:
+
 ```powershell
-pip install -r requirements.txt
+powershell -ExecutionPolicy Bypass -File scripts/install-deps.ps1
 ```
 
-Optional build dependency:
+Build-only dependencies:
 
 ```powershell
-pip install .[build]
+powershell -ExecutionPolicy Bypass -File scripts/install-deps.ps1 -BuildOnly
+```
+
+Manual equivalent if you prefer to run `pip` yourself:
+
+```powershell
+New-Item -ItemType Directory -Force .pip-temp | Out-Null
+$env:TMP = (Resolve-Path .pip-temp)
+$env:TEMP = $env:TMP
+python -m pip install ".[build]"
 ```
 
 ## Run Locally

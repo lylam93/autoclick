@@ -110,6 +110,48 @@ class WindowService:
 
         return top_level_window
 
+    def rehydrate_target(self, target_window: TargetWindow | None) -> TargetWindow | None:
+        if target_window is None:
+            return None
+
+        resolved_target = self.resolve_click_target(target_window)
+        if resolved_target is not None:
+            return resolved_target
+
+        matched_window = self.find_saved_window_match(target_window)
+        if matched_window is None:
+            return None
+
+        return self.resolve_click_target(matched_window) or matched_window
+
+    def find_saved_window_match(
+        self,
+        target_window: TargetWindow | None,
+        candidates: list[TargetWindow] | None = None,
+    ) -> TargetWindow | None:
+        if target_window is None:
+            return None
+
+        windows = candidates if candidates is not None else self.list_windows()
+        best_window: TargetWindow | None = None
+        best_score = 0
+        best_count = 0
+
+        for candidate in windows:
+            score = self._score_saved_window_match(target_window, candidate)
+            if score <= 0:
+                continue
+            if score > best_score:
+                best_window = candidate
+                best_score = score
+                best_count = 1
+            elif score == best_score:
+                best_count += 1
+
+        if best_score <= 0 or best_count != 1:
+            return None
+        return best_window
+
     def pick_window_from_cursor(self) -> TargetWindow | None:
         screen_point = wintypes.POINT()
         if not user32.GetCursorPos(ctypes.byref(screen_point)):
@@ -223,6 +265,29 @@ class WindowService:
             client_y=client_point.y,
             target_hwnd=effective_hwnd,
         )
+
+    def _score_saved_window_match(self, target_window: TargetWindow, candidate: TargetWindow) -> int:
+        if candidate.hwnd is None:
+            return 0
+
+        score = 0
+        saved_title = target_window.title.strip().casefold()
+        candidate_title = candidate.title.strip().casefold()
+        if saved_title:
+            if candidate_title == saved_title:
+                score += 8
+            elif saved_title in candidate_title or candidate_title in saved_title:
+                score += 4
+
+        saved_class = target_window.class_name.strip().casefold()
+        candidate_class = candidate.class_name.strip().casefold()
+        if saved_class and candidate_class == saved_class:
+            score += 3
+
+        if target_window.process_id is not None and candidate.process_id == target_window.process_id:
+            score += 2
+
+        return score
 
     def _belongs_to_target_family(self, hovered_hwnd: int, target_window: TargetWindow) -> bool:
         parent_hwnd = target_window.hwnd or 0

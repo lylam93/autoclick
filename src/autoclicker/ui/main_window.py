@@ -70,6 +70,7 @@ class MainWindow(QMainWindow):
         self._sync_action_states()
         self._apply_hotkeys(log_success=True)
         self._handle_refresh_windows()
+        self._maybe_warn_about_default_point()
 
     def _build_ui(self) -> None:
         root = QWidget(self)
@@ -352,6 +353,7 @@ class MainWindow(QMainWindow):
         if selected_item is not None:
             self.window_list.setCurrentItem(selected_item)
 
+        self._restore_saved_target_from_config(log_missing=False)
         self._sync_action_states()
         self._append_log(f"Refresh complete. Found {len(windows)} visible titled windows.")
 
@@ -467,6 +469,7 @@ class MainWindow(QMainWindow):
             return
 
         self._update_config_from_form()
+        self._maybe_warn_about_default_point()
         resolved_target = self._resolve_current_target("testing background click")
         if resolved_target is None:
             return
@@ -492,6 +495,7 @@ class MainWindow(QMainWindow):
             return
 
         self._update_config_from_form()
+        self._maybe_warn_about_default_point()
         resolved_target = self._resolve_current_target("starting the click loop")
         if resolved_target is None:
             return
@@ -575,6 +579,42 @@ class MainWindow(QMainWindow):
             self._append_log(self._config_store.last_message)
         return True
 
+    def _restore_saved_target_from_config(self, *, log_missing: bool) -> None:
+        saved_target = self._config.target_window
+        if saved_target.hwnd is None:
+            return
+
+        restored_target = self._window_service.rehydrate_target(saved_target)
+        if restored_target is None:
+            if log_missing:
+                self._append_log(
+                    "The saved target window from config is not available right now. Refresh and reselect it if needed."
+                )
+            return
+
+        previous_parent_hwnd = saved_target.hwnd
+        previous_effective_hwnd = saved_target.effective_hwnd
+        self._set_target_window(restored_target)
+        if (
+            restored_target.hwnd != previous_parent_hwnd
+            or restored_target.effective_hwnd != previous_effective_hwnd
+        ):
+            self._append_log(
+                f"Restored saved target window from HWND {previous_parent_hwnd} "
+                f"to HWND {restored_target.hwnd}."
+            )
+            self._maybe_log_effective_target(previous_effective_hwnd, restored_target)
+
+    def _is_primary_point_default(self) -> bool:
+        point = self._config.points[0]
+        return point.x == 0 and point.y == 0
+
+    def _maybe_warn_about_default_point(self) -> None:
+        if self._is_primary_point_default():
+            self._append_log(
+                "Primary point is still the default (0, 0). If the target does not react, capture a real point inside the window first."
+            )
+
     def _set_target_window(self, target_window: TargetWindow) -> None:
         self._config.target_window = replace(target_window)
         self._render_target_window(self._config.target_window)
@@ -614,13 +654,18 @@ class MainWindow(QMainWindow):
             self._append_log(f"Select and apply a target window before {action_name}.")
             return None
 
-        resolved_target = self._window_service.resolve_click_target(self._config.target_window)
+        previous_parent_hwnd = self._config.target_window.hwnd
+        previous_effective_hwnd = self._config.target_window.effective_hwnd
+        resolved_target = self._window_service.rehydrate_target(self._config.target_window)
         if resolved_target is None:
-            self._append_log("The selected target window is no longer valid.")
+            self._append_log("The selected target window is no longer valid. Refresh and select it again.")
             return None
 
-        previous_effective_hwnd = self._config.target_window.effective_hwnd
         self._set_target_window(resolved_target)
+        if resolved_target.hwnd != previous_parent_hwnd:
+            self._append_log(
+                f"Restored saved target window from HWND {previous_parent_hwnd} to HWND {resolved_target.hwnd}."
+            )
         self._maybe_log_effective_target(previous_effective_hwnd, resolved_target)
         return resolved_target
 
@@ -756,6 +801,7 @@ class MainWindow(QMainWindow):
         except OSError:
             pass
         super().closeEvent(event)
+
 
 
 
