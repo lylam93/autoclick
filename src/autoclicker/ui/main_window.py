@@ -52,6 +52,7 @@ class MainWindow(QMainWindow):
         self._populate_from_config(self._config)
         self._wire_events()
         self._append_log("Python + PySide6 scaffold is ready.")
+        self._sync_runtime_status()
         self._handle_refresh_windows()
 
     def _build_ui(self) -> None:
@@ -90,7 +91,7 @@ class MainWindow(QMainWindow):
         title.setStyleSheet("font-size: 22pt; font-weight: 700; color: #f7d9aa;")
 
         subtitle = QLabel(
-            "Step 2: Win32 window discovery and target selection are wired in. Background click delivery is next."
+            "Step 3: background click dispatch is wired through Win32 messages, with a test action ready for Notepad or browser targets."
         )
         subtitle.setProperty("role", "muted")
         subtitle.setWordWrap(True)
@@ -107,7 +108,7 @@ class MainWindow(QMainWindow):
         self.target_title_value = QLabel("No target selected")
         self.target_title_value.setStyleSheet("font-size: 13pt; font-weight: 600;")
 
-        self.target_meta_value = QLabel("HWND: -, Class: -, PID: -")
+        self.target_meta_value = QLabel("HWND: -, Click HWND: -, Class: -, PID: -")
         self.target_meta_value.setProperty("role", "muted")
 
         self.window_list = QListWidget()
@@ -156,7 +157,9 @@ class MainWindow(QMainWindow):
         self.primary_point_value = QLabel("(0, 0)")
         self.primary_point_value.setStyleSheet("font-size: 12pt; font-weight: 600;")
 
-        self.capture_hint = QLabel("Hotkey capture becomes active in Step 4.")
+        self.capture_hint = QLabel(
+            "Background click test uses the current primary point. Hotkey capture becomes active in Step 4."
+        )
         self.capture_hint.setProperty("role", "muted")
         self.capture_hint.setWordWrap(True)
 
@@ -213,11 +216,13 @@ class MainWindow(QMainWindow):
         layout.setSpacing(12)
 
         self.save_config_button = QPushButton("Save Config")
+        self.test_click_button = QPushButton("Test Background Click")
         self.start_button = QPushButton("Start")
         self.stop_button = QPushButton("Stop")
         self.stop_button.setEnabled(False)
 
         layout.addWidget(self.save_config_button)
+        layout.addWidget(self.test_click_button)
         layout.addStretch(1)
         layout.addWidget(self.start_button)
         layout.addWidget(self.stop_button)
@@ -234,14 +239,7 @@ class MainWindow(QMainWindow):
 
         point = config.points[0]
         self.primary_point_value.setText(f"({point.x}, {point.y})")
-
-        if config.target_window.hwnd:
-            self.target_title_value.setText(config.target_window.title or "Selected target")
-            self.target_meta_value.setText(
-                f"HWND: {config.target_window.hwnd}, "
-                f"Class: {config.target_window.class_name or '-'}, "
-                f"PID: {config.target_window.process_id or '-'}"
-            )
+        self._render_target_window(config.target_window)
 
     def _wire_events(self) -> None:
         self.refresh_windows_button.clicked.connect(self._handle_refresh_windows)
@@ -249,6 +247,7 @@ class MainWindow(QMainWindow):
         self.window_list.currentItemChanged.connect(self._handle_window_selection_changed)
         self.window_list.itemDoubleClicked.connect(self._handle_window_item_double_clicked)
         self.save_config_button.clicked.connect(self._handle_save_config)
+        self.test_click_button.clicked.connect(self._handle_test_background_click)
         self.start_button.clicked.connect(self._handle_start)
         self.stop_button.clicked.connect(self._handle_stop)
 
@@ -319,16 +318,44 @@ class MainWindow(QMainWindow):
         self._config_store.save(self._config)
         self._append_log(f"Configuration saved to {self._config_store.path}.")
 
+    def _handle_test_background_click(self) -> None:
+        if self._config.target_window.hwnd is None:
+            self._append_log("Select and apply a target window before testing background click.")
+            return
+
+        resolved_target = self._window_service.resolve_click_target(self._config.target_window)
+        if resolved_target is None:
+            self._append_log("The selected target window is no longer valid.")
+            return
+
+        self._set_target_window(resolved_target)
+        point = self._config.points[0]
+        result = self._click_engine.send_test_click(
+            resolved_target,
+            point,
+            button=self._config.click_settings.mouse_button,
+            use_post_message=False,
+        )
+
+        if resolved_target.child_hwnd and resolved_target.child_hwnd != resolved_target.hwnd:
+            self._append_log(
+                f"Resolved effective click target to child HWND {resolved_target.child_hwnd} "
+                f"({resolved_target.class_name or 'UnknownClass'})."
+            )
+
+        self._sync_runtime_status()
+        self._append_log(result.message)
+
     def _handle_start(self) -> None:
         self._click_engine.start()
-        self.status_value.setText(self._click_engine.status.state)
+        self._sync_runtime_status()
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
         self._append_log(self._click_engine.status.last_message)
 
     def _handle_stop(self) -> None:
         self._click_engine.stop()
-        self.status_value.setText(self._click_engine.status.state)
+        self._sync_runtime_status()
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
         self._append_log(self._click_engine.status.last_message)
@@ -338,11 +365,26 @@ class MainWindow(QMainWindow):
 
     def _set_target_window(self, target_window: TargetWindow) -> None:
         self._config.target_window = replace(target_window)
+        self._render_target_window(self._config.target_window)
+
+    def _render_target_window(self, target_window: TargetWindow) -> None:
+        if target_window.hwnd is None:
+            self.target_title_value.setText("No target selected")
+            self.target_meta_value.setText("HWND: -, Click HWND: -, Class: -, PID: -")
+            return
+
         self.target_title_value.setText(target_window.title or "Selected target")
         self.target_meta_value.setText(
             f"HWND: {target_window.hwnd or '-'}, "
+            f"Click HWND: {target_window.effective_hwnd or '-'}, "
             f"Class: {target_window.class_name or '-'}, "
             f"PID: {target_window.process_id or '-'}"
+        )
+
+    def _sync_runtime_status(self) -> None:
+        self.status_value.setText(self._click_engine.status.state)
+        self.click_count_value.setText(
+            f"Completed clicks: {self._click_engine.status.completed_clicks}"
         )
 
     def _format_window_item(self, target_window: TargetWindow) -> str:

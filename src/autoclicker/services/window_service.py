@@ -8,6 +8,7 @@ from autoclicker.domain.models import TargetWindow
 user32 = ctypes.windll.user32
 
 EnumWindowsProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+PREFERRED_RENDER_CLASSES = ("Chrome_RenderWidgetHostHWND",)
 
 user32.EnumWindows.argtypes = [EnumWindowsProc, wintypes.LPARAM]
 user32.EnumWindows.restype = wintypes.BOOL
@@ -73,6 +74,37 @@ class WindowService:
             return None
 
         return self._inspect_window(hwnd)
+
+    def resolve_click_target(self, target_window: TargetWindow | None) -> TargetWindow | None:
+        if target_window is None or target_window.hwnd is None:
+            return None
+
+        top_level_window = self.get_window(target_window.hwnd)
+        if top_level_window is None:
+            return None
+
+        if target_window.child_hwnd and user32.IsWindow(target_window.child_hwnd):
+            child_window = self.get_window(target_window.child_hwnd)
+            if child_window is not None:
+                return self._merge_target_window(top_level_window, child_window)
+
+        if top_level_window.class_name in PREFERRED_RENDER_CLASSES:
+            return top_level_window
+
+        for child_window in self.list_child_windows(top_level_window.hwnd or 0):
+            if child_window.class_name in PREFERRED_RENDER_CLASSES:
+                return self._merge_target_window(top_level_window, child_window)
+
+        return top_level_window
+
+    def _merge_target_window(self, parent_window: TargetWindow, child_window: TargetWindow) -> TargetWindow:
+        return TargetWindow(
+            hwnd=parent_window.hwnd,
+            title=parent_window.title,
+            class_name=child_window.class_name or parent_window.class_name,
+            process_id=parent_window.process_id,
+            child_hwnd=child_window.hwnd,
+        )
 
     def _inspect_window(self, hwnd: int) -> TargetWindow | None:
         if not user32.IsWindow(hwnd):

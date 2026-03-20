@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from typing import Any
@@ -11,6 +11,10 @@ class TargetWindow:
     class_name: str = ""
     process_id: int | None = None
     child_hwnd: int | None = None
+
+    @property
+    def effective_hwnd(self) -> int | None:
+        return self.child_hwnd or self.hwnd
 
 
 @dataclass(slots=True)
@@ -44,6 +48,18 @@ class RuntimeStatus:
 
 
 @dataclass(slots=True)
+class ClickDeliveryResult:
+    success: bool
+    message: str
+    parent_hwnd: int | None = None
+    target_hwnd: int | None = None
+    x: int = 0
+    y: int = 0
+    button: str = "left"
+    used_post_message: bool = False
+
+
+@dataclass(slots=True)
 class AppConfig:
     target_window: TargetWindow = field(default_factory=TargetWindow)
     click_settings: ClickSettings = field(default_factory=ClickSettings)
@@ -65,4 +81,3 @@ class AppConfig:
             hotkeys=hotkeys,
             points=points,
         )
-
