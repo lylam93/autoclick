@@ -60,6 +60,17 @@ class ClickDeliveryResult:
 
 
 @dataclass(slots=True)
+class PointCaptureResult:
+    success: bool
+    message: str
+    screen_x: int = 0
+    screen_y: int = 0
+    client_x: int = 0
+    client_y: int = 0
+    target_hwnd: int | None = None
+
+
+@dataclass(slots=True)
 class AppConfig:
     target_window: TargetWindow = field(default_factory=TargetWindow)
     click_settings: ClickSettings = field(default_factory=ClickSettings)

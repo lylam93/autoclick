@@ -91,7 +91,7 @@ class MainWindow(QMainWindow):
         title.setStyleSheet("font-size: 22pt; font-weight: 700; color: #f7d9aa;")
 
         subtitle = QLabel(
-            "Step 3: background click dispatch is wired through Win32 messages, with a test action ready for Notepad or browser targets."
+            "Step 4: cursor capture now converts screen coordinates into client coordinates for the resolved click target."
         )
         subtitle.setProperty("role", "muted")
         subtitle.setWordWrap(True)
@@ -157,8 +157,10 @@ class MainWindow(QMainWindow):
         self.primary_point_value = QLabel("(0, 0)")
         self.primary_point_value.setStyleSheet("font-size: 12pt; font-weight: 600;")
 
+        self.capture_point_button = QPushButton("Capture Cursor Position")
+
         self.capture_hint = QLabel(
-            "Background click test uses the current primary point. Hotkey capture becomes active in Step 4."
+            "Move the real cursor over the target window, then capture. The point is stored as client coordinates of the effective click HWND."
         )
         self.capture_hint.setProperty("role", "muted")
         self.capture_hint.setWordWrap(True)
@@ -169,6 +171,7 @@ class MainWindow(QMainWindow):
         form.addRow("Random maximum", self.random_max_spin)
         form.addRow("Max clicks", self.max_clicks_spin)
         form.addRow("Primary point", self.primary_point_value)
+        form.addRow("", self.capture_point_button)
         form.addRow("", self.capture_hint)
         return group
 
@@ -238,7 +241,7 @@ class MainWindow(QMainWindow):
         self.capture_hotkey.setText(config.hotkeys.capture_point)
 
         point = config.points[0]
-        self.primary_point_value.setText(f"({point.x}, {point.y})")
+        self._render_primary_point(point.x, point.y)
         self._render_target_window(config.target_window)
 
     def _wire_events(self) -> None:
@@ -246,6 +249,7 @@ class MainWindow(QMainWindow):
         self.use_selected_window_button.clicked.connect(self._handle_apply_selected_window)
         self.window_list.currentItemChanged.connect(self._handle_window_selection_changed)
         self.window_list.itemDoubleClicked.connect(self._handle_window_item_double_clicked)
+        self.capture_point_button.clicked.connect(self._handle_capture_point)
         self.save_config_button.clicked.connect(self._handle_save_config)
         self.test_click_button.clicked.connect(self._handle_test_background_click)
         self.start_button.clicked.connect(self._handle_start)
@@ -305,6 +309,35 @@ class MainWindow(QMainWindow):
             f"Selected target window: {selected_window.title} "
             f"(HWND={selected_window.hwnd}, Class={selected_window.class_name or '-'})"
         )
+
+    def _handle_capture_point(self) -> None:
+        if self._config.target_window.hwnd is None:
+            self._append_log("Select and apply a target window before capturing a point.")
+            return
+
+        resolved_target = self._window_service.resolve_click_target(self._config.target_window)
+        if resolved_target is None:
+            self._append_log("The selected target window is no longer valid.")
+            return
+
+        self._set_target_window(resolved_target)
+        capture_result = self._window_service.capture_cursor_point(resolved_target)
+
+        if resolved_target.child_hwnd and resolved_target.child_hwnd != resolved_target.hwnd:
+            self._append_log(
+                f"Resolved effective click target to child HWND {resolved_target.child_hwnd} "
+                f"({resolved_target.class_name or 'UnknownClass'})."
+            )
+
+        if not capture_result.success:
+            self._append_log(capture_result.message)
+            return
+
+        primary_point = self._config.points[0]
+        primary_point.x = capture_result.client_x
+        primary_point.y = capture_result.client_y
+        self._render_primary_point(primary_point.x, primary_point.y)
+        self._append_log(capture_result.message)
 
     def _handle_save_config(self) -> None:
         self._config.click_settings.delay_ms = self.delay_spin.value()
@@ -380,6 +413,9 @@ class MainWindow(QMainWindow):
             f"Class: {target_window.class_name or '-'}, "
             f"PID: {target_window.process_id or '-'}"
         )
+
+    def _render_primary_point(self, x: int, y: int) -> None:
+        self.primary_point_value.setText(f"({x}, {y})")
 
     def _sync_runtime_status(self) -> None:
         self.status_value.setText(self._click_engine.status.state)
