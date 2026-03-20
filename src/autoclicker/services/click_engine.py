@@ -7,6 +7,7 @@ from dataclasses import replace
 from ctypes import wintypes
 
 from autoclicker.domain.models import ClickDeliveryResult, ClickPoint, ClickSettings, RuntimeStatus, TargetWindow
+from autoclicker.services.app_logging import get_logger
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 
@@ -25,6 +26,8 @@ user32.SendMessageW.restype = wintypes.LPARAM
 user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
 user32.PostMessageW.restype = wintypes.BOOL
 
+LOGGER = get_logger("services.click_engine")
+
 
 class ClickEngine:
     """Owns runtime state, Win32 click delivery, and the background click loop."""
@@ -35,6 +38,7 @@ class ClickEngine:
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._worker_thread: threading.Thread | None = None
+        LOGGER.debug("ClickEngine initialized.")
 
     @property
     def status(self) -> RuntimeStatus:
@@ -59,11 +63,15 @@ class ClickEngine:
             with self._lock:
                 self._status.state = "Error"
                 self._status.last_message = "Select a valid target window before starting the loop."
+            LOGGER.warning("Refused to start loop because target HWND is invalid: %s", target_hwnd)
             return False
+
+        transport_name = "PostMessage" if use_post_message else "SendMessage"
 
         with self._lock:
             if self._running:
                 self._status.last_message = "Background click loop is already running."
+                LOGGER.info("Ignored start request because the click loop is already running.")
                 return False
 
             self._stop_event.clear()
@@ -84,7 +92,19 @@ class ClickEngine:
                 name="background-click-loop",
             )
             self._worker_thread.start()
-            return True
+
+        LOGGER.info(
+            "Background click loop started. transport=%s hwnd=%s point=(%s,%s) button=%s delay_ms=%s random=%s max_clicks=%s",
+            transport_name,
+            target_hwnd,
+            point.x,
+            point.y,
+            settings.mouse_button,
+            settings.delay_ms,
+            settings.use_random_delay,
+            settings.max_clicks,
+        )
+        return True
 
     def stop(self) -> None:
         thread_to_join: threading.Thread | None = None
@@ -93,6 +113,7 @@ class ClickEngine:
             if not self._running and self._worker_thread is None:
                 self._status.state = "Stopped"
                 self._status.last_message = "Background click loop is not running."
+                LOGGER.info("Stop requested while the click loop was already stopped.")
                 return
 
             self._stop_event.set()
@@ -100,6 +121,7 @@ class ClickEngine:
             self._status.last_message = "Stopping background click loop..."
             thread_to_join = self._worker_thread
 
+        LOGGER.info("Stopping background click loop.")
         if thread_to_join is not None and thread_to_join.is_alive() and threading.current_thread() is not thread_to_join:
             thread_to_join.join(timeout=1.0)
 
@@ -112,7 +134,19 @@ class ClickEngine:
         use_post_message: bool = False,
     ) -> ClickDeliveryResult:
         target_hwnd = target_window.effective_hwnd
+        transport_name = "PostMessage" if use_post_message else "SendMessage"
+        LOGGER.debug(
+            "Dispatching test click. transport=%s parent_hwnd=%s target_hwnd=%s point=(%s,%s) button=%s",
+            transport_name,
+            target_window.hwnd,
+            target_hwnd,
+            point.x,
+            point.y,
+            button,
+        )
+
         if target_hwnd is None:
+            LOGGER.warning("No target window is selected for background click.")
             return self._build_result(
                 success=False,
                 message="No target window is selected for background click.",
@@ -123,6 +157,7 @@ class ClickEngine:
             )
 
         if not user32.IsWindow(target_hwnd):
+            LOGGER.warning("Target HWND %s is no longer valid.", target_hwnd)
             return self._build_result(
                 success=False,
                 message=f"Target HWND {target_hwnd} is no longer valid.",
@@ -134,7 +169,6 @@ class ClickEngine:
 
         down_message, up_message, down_wparam = self._resolve_button_messages(button)
         lparam = self._pack_point(point.x, point.y)
-        transport_name = "PostMessage" if use_post_message else "SendMessage"
 
         if use_post_message:
             move_ok = bool(user32.PostMessageW(target_hwnd, WM_MOUSEMOVE, 0, lparam))
@@ -142,6 +176,14 @@ class ClickEngine:
             up_ok = bool(user32.PostMessageW(target_hwnd, up_message, 0, lparam))
             if not (move_ok and down_ok and up_ok):
                 error_code = ctypes.get_last_error()
+                LOGGER.warning(
+                    "%s failed for HWND %s at (%s,%s). Win32 error=%s",
+                    transport_name,
+                    target_hwnd,
+                    point.x,
+                    point.y,
+                    error_code,
+                )
                 return self._build_result(
                     success=False,
                     message=(
@@ -166,6 +208,7 @@ class ClickEngine:
             )
             message = self._status.last_message
 
+        LOGGER.debug(message)
         return ClickDeliveryResult(
             success=True,
             message=message,
@@ -198,6 +241,7 @@ class ClickEngine:
                         self._status.last_message = result.message
                         self._running = False
                         self._worker_thread = None
+                    LOGGER.error("Background click loop aborted because click delivery failed: %s", result.message)
                     return
 
                 max_clicks = settings.max_clicks if settings.max_clicks and settings.max_clicks > 0 else None
@@ -212,9 +256,11 @@ class ClickEngine:
                             )
                             self._running = False
                             self._worker_thread = None
+                        LOGGER.info("Background click loop reached max_clicks=%s.", max_clicks)
                         return
 
                 delay_seconds = self._next_delay_seconds(settings)
+                LOGGER.debug("Next click delay: %.3f seconds", delay_seconds)
                 if self._stop_event.wait(delay_seconds):
                     break
         finally:
@@ -228,6 +274,7 @@ class ClickEngine:
                 self._running = False
                 self._worker_thread = None
                 self._stop_event.clear()
+            LOGGER.info("Background click loop stopped.")
 
     def _build_result(
         self,

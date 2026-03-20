@@ -82,6 +82,8 @@ The default output path is `dist/AdvancedBackgroundAutoClicker`.
 - Anti-cheat systems, elevated windows, or apps using raw input can block or ignore this technique.
 - The desktop shell session used for testing must be interactive; background service sessions are not enough.
 
-## Crash Reports
+## Logs And Crash Reports
 
-Unhandled startup or UI exceptions are written to `logs/crash-YYYYMMDD-HHMMSS.log` next to the runtime entrypoint whenever possible.
+- The app writes a rolling diagnostic file to `logs/latest.log`. This is the first file to send back for debugging.
+- Each launch also creates a timestamped session log in `logs/session-YYYYMMDD-HHMMSS.log`.
+- Unhandled startup or UI exceptions are written to `logs/crash-YYYYMMDD-HHMMSS.log` next to the runtime entrypoint whenever possible.

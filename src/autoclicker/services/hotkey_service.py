@@ -7,6 +7,7 @@ from ctypes import wintypes
 from typing import Callable
 
 from autoclicker.domain.models import HotkeySettings
+from autoclicker.services.app_logging import get_logger
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -31,6 +32,8 @@ user32.PeekMessageW.restype = wintypes.BOOL
 user32.PostThreadMessageW.argtypes = [wintypes.DWORD, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
 user32.PostThreadMessageW.restype = wintypes.BOOL
 kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+
+LOGGER = get_logger("services.hotkey_service")
 
 
 @dataclass(slots=True)
@@ -60,6 +63,7 @@ class HotkeyService:
         self._listener_thread: threading.Thread | None = None
         self._listener_thread_id: int | None = None
         self._last_message = "Global hotkeys are not registered."
+        LOGGER.debug("HotkeyService initialized.")
 
     @property
     def is_registered(self) -> bool:
@@ -78,6 +82,11 @@ class HotkeyService:
         on_start_stop: Callable[[], None],
         on_capture_point: Callable[[], None],
     ) -> HotkeyRegistrationResult:
+        LOGGER.info(
+            "Registering hotkeys. start_stop=%s capture_point=%s",
+            hotkeys.start_stop,
+            hotkeys.capture_point,
+        )
         prepared_start_stop = self._parse_hotkey(
             hotkeys.start_stop,
             hotkey_id=1,
@@ -85,6 +94,7 @@ class HotkeyService:
             callback=on_start_stop,
         )
         if isinstance(prepared_start_stop, HotkeyRegistrationResult):
+            LOGGER.warning(prepared_start_stop.message)
             return prepared_start_stop
 
         prepared_capture = self._parse_hotkey(
@@ -94,15 +104,18 @@ class HotkeyService:
             callback=on_capture_point,
         )
         if isinstance(prepared_capture, HotkeyRegistrationResult):
+            LOGGER.warning(prepared_capture.message)
             return prepared_capture
 
         if (
             prepared_start_stop.modifiers == prepared_capture.modifiers
             and prepared_start_stop.virtual_key == prepared_capture.virtual_key
         ):
+            message = "Start / Stop and Get Position cannot use the same hotkey."
+            LOGGER.warning(message)
             return HotkeyRegistrationResult(
                 success=False,
-                message="Start / Stop and Get Position cannot use the same hotkey.",
+                message=message,
             )
 
         self.unregister()
@@ -125,6 +138,7 @@ class HotkeyService:
             )
             with self._lock:
                 self._last_message = result.message
+            LOGGER.error(result.message)
             return result
 
         if not bool(startup_state.get("success")):
@@ -139,6 +153,7 @@ class HotkeyService:
                 self._listener_thread = None
                 self._listener_thread_id = None
                 self._last_message = result.message
+            LOGGER.warning(result.message)
             return result
 
         with self._lock:
@@ -146,6 +161,7 @@ class HotkeyService:
             self._listener_thread = thread
             self._last_message = str(startup_state.get("message", "Global hotkeys registered."))
 
+        LOGGER.info(self._last_message)
         return HotkeyRegistrationResult(
             success=True,
             message=self._last_message,
@@ -165,6 +181,7 @@ class HotkeyService:
             self._listener_thread_id = None
 
         if thread_id is not None:
+            LOGGER.info("Unregistering global hotkeys from thread %s", thread_id)
             user32.PostThreadMessageW(thread_id, WM_QUIT, 0, 0)
 
         if thread_to_join is not None and thread_to_join.is_alive():
@@ -206,6 +223,13 @@ class HotkeyService:
                     return
 
                 registered_ids.append(prepared.hotkey_id)
+                LOGGER.debug(
+                    "Registered hotkey %s as id=%s modifiers=%s vk=%s",
+                    prepared.display,
+                    prepared.hotkey_id,
+                    prepared.modifiers,
+                    prepared.virtual_key,
+                )
 
             startup_state["success"] = True
             startup_state["message"] = (
@@ -220,11 +244,13 @@ class HotkeyService:
                 if message_result == 0:
                     break
                 if message_result == -1:
+                    LOGGER.error("GetMessageW returned -1 in hotkey listener thread.")
                     break
 
                 if msg.message == WM_HOTKEY:
                     callback = callbacks.get(int(msg.wParam))
                     if callback is not None:
+                        LOGGER.debug("Hotkey pressed for id=%s", int(msg.wParam))
                         callback()
         finally:
             for hotkey_id in registered_ids:
@@ -233,6 +259,7 @@ class HotkeyService:
             with self._lock:
                 self._registered = False
                 self._listener_thread_id = None
+            LOGGER.info("Hotkey listener thread stopped.")
 
     def _parse_hotkey(
         self,

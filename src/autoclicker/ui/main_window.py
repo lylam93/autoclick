@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
 
 from PySide6.QtCore import QObject, QTimer, Qt, Signal
 from PySide6.QtGui import QCloseEvent
@@ -22,6 +23,7 @@ from PySide6.QtWidgets import (
 )
 
 from autoclicker.domain.models import AppConfig, RuntimeStatus, TargetWindow
+from autoclicker.services.app_logging import get_logger
 from autoclicker.services.click_engine import ClickEngine
 from autoclicker.services.config_store import ConfigStore
 from autoclicker.services.hotkey_service import HotkeyService
@@ -42,12 +44,15 @@ class MainWindow(QMainWindow):
         window_service: WindowService,
         click_engine: ClickEngine,
         hotkey_service: HotkeyService,
+        diagnostic_log_path: Path | None = None,
     ) -> None:
         super().__init__()
+        self._logger = get_logger("ui.main_window")
         self._config_store = config_store
         self._window_service = window_service
         self._click_engine = click_engine
         self._hotkey_service = hotkey_service
+        self._diagnostic_log_path = diagnostic_log_path
         self._config = self._config_store.load()
         self._pending_config_message = self._config_store.last_message
         self._discovered_windows: dict[int, TargetWindow] = {}
@@ -66,6 +71,8 @@ class MainWindow(QMainWindow):
         self._append_log("Python + PySide6 scaffold is ready.")
         if self._pending_config_message:
             self._append_log(self._pending_config_message)
+        if self._diagnostic_log_path is not None:
+            self._append_log(f"Diagnostic log file: {self._diagnostic_log_path}")
         self._sync_runtime_status()
         self._sync_action_states()
         self._apply_hotkeys(log_success=True)
@@ -537,6 +544,9 @@ class MainWindow(QMainWindow):
         self._handle_capture_point()
 
     def _append_log(self, message: str) -> None:
+        if not message:
+            return
+        self._logger.info(message)
         self.log_output.appendPlainText(message)
 
     def _apply_hotkeys(self, *, log_success: bool) -> bool:
@@ -792,6 +802,7 @@ class MainWindow(QMainWindow):
         )
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        self._logger.info("Main window closing.")
         self._status_timer.stop()
         self._update_config_from_form()
         self._click_engine.stop()
@@ -799,7 +810,7 @@ class MainWindow(QMainWindow):
         try:
             self._config_store.save(self._config)
         except OSError:
-            pass
+            self._logger.exception("Failed to save config during shutdown.")
         super().closeEvent(event)
 
 

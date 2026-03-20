@@ -4,6 +4,7 @@ import ctypes
 from ctypes import wintypes
 
 from autoclicker.domain.models import PointCaptureResult, TargetWindow
+from autoclicker.services.app_logging import get_logger
 
 user32 = ctypes.windll.user32
 
@@ -41,6 +42,8 @@ user32.ScreenToClient.restype = wintypes.BOOL
 user32.WindowFromPoint.argtypes = [wintypes.POINT]
 user32.WindowFromPoint.restype = wintypes.HWND
 
+LOGGER = get_logger("services.window_service")
+
 
 class WindowService:
     """Discovers top-level and child windows for Win32 targeting."""
@@ -64,10 +67,12 @@ class WindowService:
             return True
 
         user32.EnumWindows(callback, 0)
+        LOGGER.debug("Enumerated %s visible titled top-level windows.", len(windows))
         return sorted(windows, key=lambda window: (window.title.lower(), window.hwnd or 0))
 
     def list_child_windows(self, parent_hwnd: int) -> list[TargetWindow]:
         if not parent_hwnd or not user32.IsWindow(parent_hwnd):
+            LOGGER.debug("Cannot enumerate child windows for invalid parent HWND %s", parent_hwnd)
             return []
 
         windows: list[TargetWindow] = []
@@ -80,6 +85,7 @@ class WindowService:
             return True
 
         user32.EnumChildWindows(parent_hwnd, callback, 0)
+        LOGGER.debug("Enumerated %s child windows for parent HWND %s.", len(windows), parent_hwnd)
         return windows
 
     def get_window(self, hwnd: int | None) -> TargetWindow | None:
@@ -90,24 +96,39 @@ class WindowService:
 
     def resolve_click_target(self, target_window: TargetWindow | None) -> TargetWindow | None:
         if target_window is None or target_window.hwnd is None:
+            LOGGER.debug("resolve_click_target called without a valid target window.")
             return None
 
         top_level_window = self.get_window(target_window.hwnd)
         if top_level_window is None:
+            LOGGER.debug("Top-level HWND %s is no longer valid.", target_window.hwnd)
             return None
 
         if target_window.child_hwnd and user32.IsWindow(target_window.child_hwnd):
             child_window = self.get_window(target_window.child_hwnd)
             if child_window is not None:
+                LOGGER.debug(
+                    "Using previously saved child HWND %s for parent HWND %s.",
+                    target_window.child_hwnd,
+                    target_window.hwnd,
+                )
                 return self._merge_target_window(top_level_window, child_window)
 
         if top_level_window.class_name in PREFERRED_RENDER_CLASSES:
+            LOGGER.debug("Top-level window %s already matches a preferred render class.", top_level_window.hwnd)
             return top_level_window
 
         for child_window in self.list_child_windows(top_level_window.hwnd or 0):
             if child_window.class_name in PREFERRED_RENDER_CLASSES:
+                LOGGER.info(
+                    "Resolved child render HWND %s (%s) for parent HWND %s.",
+                    child_window.hwnd,
+                    child_window.class_name,
+                    top_level_window.hwnd,
+                )
                 return self._merge_target_window(top_level_window, child_window)
 
+        LOGGER.debug("Falling back to top-level HWND %s for click delivery.", top_level_window.hwnd)
         return top_level_window
 
     def rehydrate_target(self, target_window: TargetWindow | None) -> TargetWindow | None:
@@ -118,10 +139,24 @@ class WindowService:
         if resolved_target is not None:
             return resolved_target
 
+        LOGGER.info(
+            "Attempting to rehydrate stale target HWND %s using saved metadata title=%r class=%r pid=%r.",
+            target_window.hwnd,
+            target_window.title,
+            target_window.class_name,
+            target_window.process_id,
+        )
         matched_window = self.find_saved_window_match(target_window)
         if matched_window is None:
+            LOGGER.warning(
+                "Could not find a unique live window matching the saved target title=%r class=%r pid=%r.",
+                target_window.title,
+                target_window.class_name,
+                target_window.process_id,
+            )
             return None
 
+        LOGGER.info("Rehydrated saved target to live HWND %s.", matched_window.hwnd)
         return self.resolve_click_target(matched_window) or matched_window
 
     def find_saved_window_match(
@@ -141,6 +176,14 @@ class WindowService:
             score = self._score_saved_window_match(target_window, candidate)
             if score <= 0:
                 continue
+            LOGGER.debug(
+                "Candidate HWND %s scored %s for saved target title=%r class=%r pid=%r.",
+                candidate.hwnd,
+                score,
+                target_window.title,
+                target_window.class_name,
+                target_window.process_id,
+            )
             if score > best_score:
                 best_window = candidate
                 best_score = score
@@ -155,63 +198,82 @@ class WindowService:
     def pick_window_from_cursor(self) -> TargetWindow | None:
         screen_point = wintypes.POINT()
         if not user32.GetCursorPos(ctypes.byref(screen_point)):
+            LOGGER.warning("GetCursorPos failed while picking a window from the cursor.")
             return None
 
         hovered_hwnd = user32.WindowFromPoint(screen_point)
         if not hovered_hwnd:
+            LOGGER.warning("WindowFromPoint did not return a window under cursor (%s,%s).", screen_point.x, screen_point.y)
             return None
 
         root_hwnd = user32.GetAncestor(hovered_hwnd, GA_ROOT) or hovered_hwnd
         top_level_window = self.get_window(root_hwnd)
         if top_level_window is None:
+            LOGGER.warning("Could not inspect root HWND %s from cursor picker.", root_hwnd)
             return None
 
         hovered_window = self.get_window(hovered_hwnd)
         if hovered_window is not None and hovered_window.hwnd != top_level_window.hwnd:
             if hovered_window.class_name in PREFERRED_RENDER_CLASSES:
+                LOGGER.info(
+                    "Cursor picker selected child render HWND %s for parent HWND %s.",
+                    hovered_window.hwnd,
+                    top_level_window.hwnd,
+                )
                 return self._merge_target_window(top_level_window, hovered_window)
 
+        LOGGER.info("Cursor picker selected top-level HWND %s.", top_level_window.hwnd)
         return self.resolve_click_target(top_level_window) or top_level_window
 
     def capture_cursor_point(self, target_window: TargetWindow | None) -> PointCaptureResult:
         if target_window is None or target_window.hwnd is None:
+            message = "Select a valid target window before capturing a point."
+            LOGGER.warning(message)
             return PointCaptureResult(
                 success=False,
-                message="Select a valid target window before capturing a point.",
+                message=message,
             )
 
         resolved_target = self.resolve_click_target(target_window)
         if resolved_target is None or resolved_target.effective_hwnd is None:
+            message = "The selected target window is no longer valid."
+            LOGGER.warning(message)
             return PointCaptureResult(
                 success=False,
-                message="The selected target window is no longer valid.",
+                message=message,
                 target_hwnd=target_window.effective_hwnd,
             )
 
         effective_hwnd = resolved_target.effective_hwnd
         if not user32.IsWindow(effective_hwnd):
+            message = f"Target HWND {effective_hwnd} is no longer valid."
+            LOGGER.warning(message)
             return PointCaptureResult(
                 success=False,
-                message=f"Target HWND {effective_hwnd} is no longer valid.",
+                message=message,
                 target_hwnd=effective_hwnd,
             )
 
         screen_point = wintypes.POINT()
         if not user32.GetCursorPos(ctypes.byref(screen_point)):
+            message = "Windows did not return the current cursor position."
+            LOGGER.warning(message)
             return PointCaptureResult(
                 success=False,
-                message="Windows did not return the current cursor position.",
+                message=message,
                 target_hwnd=effective_hwnd,
             )
 
         hovered_hwnd = user32.WindowFromPoint(screen_point)
         if hovered_hwnd and not self._belongs_to_target_family(hovered_hwnd, resolved_target):
+            message = (
+                "Move the cursor over the selected target window before capturing the point. "
+                f"Current screen position is ({screen_point.x}, {screen_point.y})."
+            )
+            LOGGER.info(message)
             return PointCaptureResult(
                 success=False,
-                message=(
-                    "Move the cursor over the selected target window before capturing the point. "
-                    f"Current screen position is ({screen_point.x}, {screen_point.y})."
-                ),
+                message=message,
                 screen_x=screen_point.x,
                 screen_y=screen_point.y,
                 target_hwnd=effective_hwnd,
@@ -219,9 +281,11 @@ class WindowService:
 
         client_point = wintypes.POINT(screen_point.x, screen_point.y)
         if not user32.ScreenToClient(effective_hwnd, ctypes.byref(client_point)):
+            message = f"ScreenToClient failed for HWND {effective_hwnd}."
+            LOGGER.warning(message)
             return PointCaptureResult(
                 success=False,
-                message=f"ScreenToClient failed for HWND {effective_hwnd}.",
+                message=message,
                 screen_x=screen_point.x,
                 screen_y=screen_point.y,
                 target_hwnd=effective_hwnd,
@@ -229,9 +293,11 @@ class WindowService:
 
         client_rect = wintypes.RECT()
         if not user32.GetClientRect(effective_hwnd, ctypes.byref(client_rect)):
+            message = f"GetClientRect failed for HWND {effective_hwnd}."
+            LOGGER.warning(message)
             return PointCaptureResult(
                 success=False,
-                message=f"GetClientRect failed for HWND {effective_hwnd}.",
+                message=message,
                 screen_x=screen_point.x,
                 screen_y=screen_point.y,
                 client_x=client_point.x,
@@ -240,12 +306,14 @@ class WindowService:
             )
 
         if not (0 <= client_point.x < client_rect.right and 0 <= client_point.y < client_rect.bottom):
+            message = (
+                f"Captured point ({client_point.x}, {client_point.y}) is outside the client area "
+                f"of HWND {effective_hwnd}."
+            )
+            LOGGER.info(message)
             return PointCaptureResult(
                 success=False,
-                message=(
-                    f"Captured point ({client_point.x}, {client_point.y}) is outside the client area "
-                    f"of HWND {effective_hwnd}."
-                ),
+                message=message,
                 screen_x=screen_point.x,
                 screen_y=screen_point.y,
                 client_x=client_point.x,
@@ -253,12 +321,14 @@ class WindowService:
                 target_hwnd=effective_hwnd,
             )
 
+        message = (
+            f"Captured client point ({client_point.x}, {client_point.y}) from screen "
+            f"({screen_point.x}, {screen_point.y}) for HWND {effective_hwnd}."
+        )
+        LOGGER.info(message)
         return PointCaptureResult(
             success=True,
-            message=(
-                f"Captured client point ({client_point.x}, {client_point.y}) from screen "
-                f"({screen_point.x}, {screen_point.y}) for HWND {effective_hwnd}."
-            ),
+            message=message,
             screen_x=screen_point.x,
             screen_y=screen_point.y,
             client_x=client_point.x,

@@ -6,6 +6,10 @@ from pathlib import Path
 from typing import Any
 
 from autoclicker.domain.models import AppConfig
+from autoclicker.services.app_logging import get_logger
+
+
+LOGGER = get_logger("services.config_store")
 
 
 class ConfigStore:
@@ -16,6 +20,7 @@ class ConfigStore:
     def __init__(self, path: Path | None = None) -> None:
         self._path = path or Path("config.json")
         self._last_message = f"Configuration path is {self._path.resolve()}."
+        LOGGER.debug("ConfigStore initialized for %s", self._path.resolve())
 
     @property
     def path(self) -> Path:
@@ -31,6 +36,7 @@ class ConfigStore:
                 f"No config file was found at {self._path.resolve()}. "
                 "Using the default settings for this session."
             )
+            LOGGER.info(self._last_message)
             return AppConfig()
 
         try:
@@ -40,6 +46,7 @@ class ConfigStore:
                 f"Could not read {self._path.resolve()} cleanly ({exc}). "
                 "Using the default settings for this session."
             )
+            LOGGER.warning(self._last_message)
             return AppConfig()
 
         if not isinstance(raw_payload, dict):
@@ -47,6 +54,7 @@ class ConfigStore:
                 f"Config file {self._path.resolve()} does not contain a JSON object. "
                 "Using the default settings for this session."
             )
+            LOGGER.warning(self._last_message)
             return AppConfig()
 
         version = raw_payload.get("version")
@@ -67,6 +75,7 @@ class ConfigStore:
 
         config = AppConfig.from_dict(raw_config if isinstance(raw_config, dict) else None)
         self._last_message = message
+        LOGGER.info(message)
         return config
 
     def save(self, config: AppConfig) -> None:
@@ -89,3 +98,4 @@ class ConfigStore:
             f"Configuration saved to {self._path.resolve()} "
             f"(format v{self.CURRENT_VERSION})."
         )
+        LOGGER.info(self._last_message)
