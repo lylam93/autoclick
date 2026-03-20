@@ -9,11 +9,14 @@ user32 = ctypes.windll.user32
 
 EnumWindowsProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 PREFERRED_RENDER_CLASSES = ("Chrome_RenderWidgetHostHWND",)
+GA_ROOT = 2
 
 user32.EnumWindows.argtypes = [EnumWindowsProc, wintypes.LPARAM]
 user32.EnumWindows.restype = wintypes.BOOL
 user32.EnumChildWindows.argtypes = [wintypes.HWND, EnumWindowsProc, wintypes.LPARAM]
 user32.EnumChildWindows.restype = wintypes.BOOL
+user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+user32.GetAncestor.restype = wintypes.HWND
 user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
 user32.GetClassNameW.restype = ctypes.c_int
 user32.GetClientRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
@@ -106,6 +109,27 @@ class WindowService:
                 return self._merge_target_window(top_level_window, child_window)
 
         return top_level_window
+
+    def pick_window_from_cursor(self) -> TargetWindow | None:
+        screen_point = wintypes.POINT()
+        if not user32.GetCursorPos(ctypes.byref(screen_point)):
+            return None
+
+        hovered_hwnd = user32.WindowFromPoint(screen_point)
+        if not hovered_hwnd:
+            return None
+
+        root_hwnd = user32.GetAncestor(hovered_hwnd, GA_ROOT) or hovered_hwnd
+        top_level_window = self.get_window(root_hwnd)
+        if top_level_window is None:
+            return None
+
+        hovered_window = self.get_window(hovered_hwnd)
+        if hovered_window is not None and hovered_window.hwnd != top_level_window.hwnd:
+            if hovered_window.class_name in PREFERRED_RENDER_CLASSES:
+                return self._merge_target_window(top_level_window, hovered_window)
+
+        return self.resolve_click_target(top_level_window) or top_level_window
 
     def capture_cursor_point(self, target_window: TargetWindow | None) -> PointCaptureResult:
         if target_window is None or target_window.hwnd is None:
@@ -256,4 +280,3 @@ class WindowService:
         process_id = wintypes.DWORD(0)
         user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
         return int(process_id.value) if process_id.value else None
-

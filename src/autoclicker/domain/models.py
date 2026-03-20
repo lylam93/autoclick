@@ -32,6 +32,7 @@ class ClickSettings:
     random_max_ms: int = 1100
     max_clicks: int | None = None
     mouse_button: str = "left"
+    delivery_mode: str = "send"
 
 
 @dataclass(slots=True)
