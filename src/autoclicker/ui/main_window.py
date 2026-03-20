@@ -2,14 +2,14 @@
 
 from dataclasses import replace
 
-from PySide6.QtCore import QTimer, Qt
+from PySide6.QtCore import QObject, QTimer, Qt, Signal
+from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QCheckBox,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
@@ -25,6 +25,12 @@ from autoclicker.services.click_engine import ClickEngine
 from autoclicker.services.config_store import ConfigStore
 from autoclicker.services.hotkey_service import HotkeyService
 from autoclicker.services.window_service import WindowService
+from autoclicker.ui.hotkey_edit import HotkeyLineEdit
+
+
+class HotkeyBridge(QObject):
+    toggle_requested = Signal()
+    capture_requested = Signal()
 
 
 class MainWindow(QMainWindow):
@@ -43,6 +49,7 @@ class MainWindow(QMainWindow):
         self._hotkey_service = hotkey_service
         self._config = self._config_store.load()
         self._discovered_windows: dict[int, TargetWindow] = {}
+        self._hotkey_bridge = HotkeyBridge(self)
         self._last_terminal_message = self._click_engine.status.last_message
 
         self.setWindowTitle("Advanced Background Auto-Clicker")
@@ -56,6 +63,7 @@ class MainWindow(QMainWindow):
         self._append_log("Python + PySide6 scaffold is ready.")
         self._sync_runtime_status()
         self._sync_action_states()
+        self._apply_hotkeys(log_success=True)
         self._handle_refresh_windows()
 
     def _build_ui(self) -> None:
@@ -94,7 +102,7 @@ class MainWindow(QMainWindow):
         title.setStyleSheet("font-size: 22pt; font-weight: 700; color: #f7d9aa;")
 
         subtitle = QLabel(
-            "Step 5: the background click loop now runs in its own worker thread with stop signals, random delay, and max-click limits."
+            "Step 6: global Start / Stop and Get Position hotkeys now register natively through Win32 and can be reassigned directly from the UI."
         )
         subtitle.setProperty("role", "muted")
         subtitle.setWordWrap(True)
@@ -163,7 +171,7 @@ class MainWindow(QMainWindow):
         self.capture_point_button = QPushButton("Capture Cursor Position")
 
         self.capture_hint = QLabel(
-            "Move the real cursor over the target window, then capture. Start uses the current point, delay, random range, and max-click settings shown here."
+            "Move the real cursor over the target window, then capture. Start uses the current point, delay, random range, max-click settings, and global hotkeys shown here."
         )
         self.capture_hint.setProperty("role", "muted")
         self.capture_hint.setWordWrap(True)
@@ -183,18 +191,23 @@ class MainWindow(QMainWindow):
         form = QFormLayout(group)
         form.setSpacing(12)
 
-        self.start_stop_hotkey = QLineEdit()
-        self.capture_hotkey = QLineEdit()
+        self.start_stop_hotkey = HotkeyLineEdit()
+        self.capture_hotkey = HotkeyLineEdit()
+        self.apply_hotkeys_button = QPushButton("Apply Hotkeys")
+        self.hotkey_status_value = QLabel("Global hotkeys are not registered.")
+        self.hotkey_status_value.setWordWrap(True)
+        self.hotkey_status_value.setProperty("role", "muted")
 
-        self.start_stop_hotkey.setPlaceholderText("Press a key...")
-        self.capture_hotkey.setPlaceholderText("Press a key...")
-
-        hotkey_note = QLabel("Editable UI bindings are scaffolded now; native registration lands in Step 6.")
+        hotkey_note = QLabel(
+            "Click an input, press a combination like F8 or Ctrl+Shift+S, then apply. These hotkeys work even when the app is not focused."
+        )
         hotkey_note.setWordWrap(True)
         hotkey_note.setProperty("role", "muted")
 
         form.addRow("Start / Stop", self.start_stop_hotkey)
         form.addRow("Get Position", self.capture_hotkey)
+        form.addRow("", self.apply_hotkeys_button)
+        form.addRow("", self.hotkey_status_value)
         form.addRow("", hotkey_note)
         return group
 
@@ -253,10 +266,13 @@ class MainWindow(QMainWindow):
         self.window_list.currentItemChanged.connect(self._handle_window_selection_changed)
         self.window_list.itemDoubleClicked.connect(self._handle_window_item_double_clicked)
         self.capture_point_button.clicked.connect(self._handle_capture_point)
+        self.apply_hotkeys_button.clicked.connect(self._handle_apply_hotkeys)
         self.save_config_button.clicked.connect(self._handle_save_config)
         self.test_click_button.clicked.connect(self._handle_test_background_click)
         self.start_button.clicked.connect(self._handle_start)
         self.stop_button.clicked.connect(self._handle_stop)
+        self._hotkey_bridge.toggle_requested.connect(self._handle_hotkey_toggle)
+        self._hotkey_bridge.capture_requested.connect(self._handle_hotkey_capture)
 
     def _start_status_timer(self) -> None:
         self._status_timer = QTimer(self)
@@ -364,10 +380,15 @@ class MainWindow(QMainWindow):
         self._render_primary_point(primary_point.x, primary_point.y)
         self._append_log(capture_result.message)
 
+    def _handle_apply_hotkeys(self) -> None:
+        self._update_config_from_form()
+        self._apply_hotkeys(log_success=True)
+
     def _handle_save_config(self) -> None:
         self._update_config_from_form()
         self._config_store.save(self._config)
         self._append_log(f"Configuration saved to {self._config_store.path}.")
+        self._apply_hotkeys(log_success=True)
 
     def _handle_test_background_click(self) -> None:
         if self._is_engine_busy():
@@ -445,8 +466,43 @@ class MainWindow(QMainWindow):
             self._append_log(status.last_message)
             self._last_terminal_message = status.last_message
 
+    def _handle_hotkey_toggle(self) -> None:
+        if self._click_engine.status.state in {"Running", "Stopping"}:
+            self._handle_stop()
+            return
+        self._handle_start()
+
+    def _handle_hotkey_capture(self) -> None:
+        self._handle_capture_point()
+
     def _append_log(self, message: str) -> None:
         self.log_output.appendPlainText(message)
+
+    def _apply_hotkeys(self, *, log_success: bool) -> bool:
+        result = self._hotkey_service.register(
+            self._config.hotkeys,
+            on_start_stop=self._hotkey_bridge.toggle_requested.emit,
+            on_capture_point=self._hotkey_bridge.capture_requested.emit,
+        )
+
+        if result.normalized_start_stop:
+            self.start_stop_hotkey.setText(result.normalized_start_stop)
+            self._config.hotkeys.start_stop = result.normalized_start_stop
+        if result.normalized_capture_point:
+            self.capture_hotkey.setText(result.normalized_capture_point)
+            self._config.hotkeys.capture_point = result.normalized_capture_point
+
+        self.hotkey_status_value.setText(result.message)
+        if result.success:
+            self.hotkey_status_value.setStyleSheet("color: #b5bdcc;")
+        else:
+            self.hotkey_status_value.setStyleSheet("color: #ffb4a2;")
+
+        if result.success and not log_success:
+            return True
+
+        self._append_log(result.message)
+        return result.success
 
     def _set_target_window(self, target_window: TargetWindow) -> None:
         self._config.target_window = replace(target_window)
@@ -512,3 +568,9 @@ class MainWindow(QMainWindow):
             f"PID={process_id} | "
             f"HWND={target_window.hwnd}"
         )
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        self._status_timer.stop()
+        self._hotkey_service.unregister()
+        self._click_engine.stop()
+        super().closeEvent(event)
