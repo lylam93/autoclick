@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import ctypes
 from ctypes import wintypes
@@ -11,6 +11,7 @@ user32 = ctypes.windll.user32
 EnumWindowsProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 PREFERRED_RENDER_CLASSES = ("Chrome_RenderWidgetHostHWND",)
 GA_ROOT = 2
+GW_HWNDNEXT = 2
 
 user32.EnumWindows.argtypes = [EnumWindowsProc, wintypes.LPARAM]
 user32.EnumWindows.restype = wintypes.BOOL
@@ -24,6 +25,12 @@ user32.GetClientRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
 user32.GetClientRect.restype = wintypes.BOOL
 user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
 user32.GetCursorPos.restype = wintypes.BOOL
+user32.GetTopWindow.argtypes = [wintypes.HWND]
+user32.GetTopWindow.restype = wintypes.HWND
+user32.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
+user32.GetWindow.restype = wintypes.HWND
+user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+user32.GetWindowRect.restype = wintypes.BOOL
 user32.GetShellWindow.restype = wintypes.HWND
 user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
 user32.GetWindowTextLengthW.restype = ctypes.c_int
@@ -37,6 +44,8 @@ user32.IsWindow.argtypes = [wintypes.HWND]
 user32.IsWindow.restype = wintypes.BOOL
 user32.IsWindowVisible.argtypes = [wintypes.HWND]
 user32.IsWindowVisible.restype = wintypes.BOOL
+user32.RealChildWindowFromPoint.argtypes = [wintypes.HWND, wintypes.POINT]
+user32.RealChildWindowFromPoint.restype = wintypes.HWND
 user32.ScreenToClient.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.POINT)]
 user32.ScreenToClient.restype = wintypes.BOOL
 user32.WindowFromPoint.argtypes = [wintypes.POINT]
@@ -159,6 +168,36 @@ class WindowService:
         LOGGER.info("Rehydrated saved target to live HWND %s.", matched_window.hwnd)
         return self.resolve_click_target(matched_window) or matched_window
 
+    def with_effective_hwnd(self, target_window: TargetWindow | None, effective_hwnd: int | None) -> TargetWindow | None:
+        if target_window is None or target_window.hwnd is None:
+            return None
+
+        top_level_window = self.get_window(target_window.hwnd) or target_window
+        if effective_hwnd is None or effective_hwnd == top_level_window.hwnd:
+            return top_level_window
+        if not user32.IsWindow(effective_hwnd):
+            LOGGER.debug("Cannot adopt invalid effective HWND %s for parent HWND %s.", effective_hwnd, top_level_window.hwnd)
+            return top_level_window
+        if not user32.IsChild(top_level_window.hwnd or 0, effective_hwnd):
+            LOGGER.debug(
+                "Rejected effective HWND %s because it is not a child of parent HWND %s.",
+                effective_hwnd,
+                top_level_window.hwnd,
+            )
+            return top_level_window
+
+        child_window = self.get_window(effective_hwnd)
+        if child_window is None:
+            return top_level_window
+
+        LOGGER.info(
+            "Resolved effective click target to child HWND %s (%s) under parent HWND %s.",
+            child_window.hwnd,
+            child_window.class_name or "UnknownClass",
+            top_level_window.hwnd,
+        )
+        return self._merge_target_window(top_level_window, child_window)
+
     def find_saved_window_match(
         self,
         target_window: TargetWindow | None,
@@ -207,7 +246,7 @@ class WindowService:
             return None
 
         root_hwnd = user32.GetAncestor(hovered_hwnd, GA_ROOT) or hovered_hwnd
-        top_level_window = self.get_window(root_hwnd)
+        top_level_window = self._pick_top_level_window_from_point(screen_point, root_hwnd)
         if top_level_window is None:
             LOGGER.warning("Could not inspect root HWND %s from cursor picker.", root_hwnd)
             return None
@@ -244,6 +283,7 @@ class WindowService:
                 target_hwnd=target_window.effective_hwnd,
             )
 
+        parent_hwnd = resolved_target.hwnd or resolved_target.effective_hwnd
         effective_hwnd = resolved_target.effective_hwnd
         if not user32.IsWindow(effective_hwnd):
             message = f"Target HWND {effective_hwnd} is no longer valid."
@@ -265,7 +305,7 @@ class WindowService:
             )
 
         hovered_hwnd = user32.WindowFromPoint(screen_point)
-        if hovered_hwnd and not self._belongs_to_target_family(hovered_hwnd, resolved_target):
+        if parent_hwnd and not self._contains_screen_point(parent_hwnd, screen_point):
             message = (
                 "Move the cursor over the selected target window before capturing the point. "
                 f"Current screen position is ({screen_point.x}, {screen_point.y})."
@@ -277,6 +317,29 @@ class WindowService:
                 screen_x=screen_point.x,
                 screen_y=screen_point.y,
                 target_hwnd=effective_hwnd,
+            )
+
+        if hovered_hwnd and not self._belongs_to_target_family(hovered_hwnd, resolved_target):
+            hovered_root_hwnd = user32.GetAncestor(hovered_hwnd, GA_ROOT) or hovered_hwnd
+            LOGGER.info(
+                "WindowFromPoint returned HWND %s (root HWND %s) while capturing for parent HWND %s. "
+                "Continuing because the screen point is inside the selected window bounds.",
+                hovered_hwnd,
+                hovered_root_hwnd,
+                parent_hwnd,
+            )
+
+        point_target = self.resolve_click_target_for_point(resolved_target, screen_point) or resolved_target
+        effective_hwnd = point_target.effective_hwnd
+        if effective_hwnd is None or not user32.IsWindow(effective_hwnd):
+            message = "The selected click target could not be resolved for the captured point."
+            LOGGER.warning(message)
+            return PointCaptureResult(
+                success=False,
+                message=message,
+                screen_x=screen_point.x,
+                screen_y=screen_point.y,
+                target_hwnd=resolved_target.effective_hwnd,
             )
 
         client_point = wintypes.POINT(screen_point.x, screen_point.y)
@@ -325,6 +388,8 @@ class WindowService:
             f"Captured client point ({client_point.x}, {client_point.y}) from screen "
             f"({screen_point.x}, {screen_point.y}) for HWND {effective_hwnd}."
         )
+        if point_target.hwnd and effective_hwnd != point_target.hwnd:
+            message += f" Parent HWND is {point_target.hwnd}."
         LOGGER.info(message)
         return PointCaptureResult(
             success=True,
@@ -335,6 +400,22 @@ class WindowService:
             client_y=client_point.y,
             target_hwnd=effective_hwnd,
         )
+
+    def resolve_click_target_for_point(
+        self,
+        target_window: TargetWindow | None,
+        screen_point: wintypes.POINT,
+    ) -> TargetWindow | None:
+        resolved_target = self.resolve_click_target(target_window)
+        if resolved_target is None or resolved_target.hwnd is None:
+            return None
+
+        point_hwnd = self._find_deepest_child_at_screen_point(resolved_target.hwnd, screen_point)
+        if point_hwnd and point_hwnd != resolved_target.hwnd:
+            point_target = self.with_effective_hwnd(resolved_target, point_hwnd)
+            if point_target is not None:
+                return point_target
+        return resolved_target
 
     def _score_saved_window_match(self, target_window: TargetWindow, candidate: TargetWindow) -> int:
         if candidate.hwnd is None:
@@ -370,6 +451,80 @@ class WindowService:
         if parent_hwnd and user32.IsChild(parent_hwnd, hovered_hwnd):
             return True
         return False
+
+    def _pick_top_level_window_from_point(
+        self,
+        screen_point: wintypes.POINT,
+        hovered_root_hwnd: int,
+    ) -> TargetWindow | None:
+        hovered_root = self.get_window(hovered_root_hwnd)
+        if hovered_root is not None and hovered_root.title:
+            return hovered_root
+
+        for hwnd in self._iter_top_level_windows_in_z_order():
+            if hwnd == hovered_root_hwnd:
+                continue
+
+            candidate = self.get_window(hwnd)
+            if candidate is None or not candidate.title:
+                continue
+            if not self._contains_screen_point(hwnd, screen_point):
+                continue
+
+            LOGGER.info(
+                "Cursor picker skipped top-level HWND %s (%s) with no title and selected titled HWND %s (%r) underneath.",
+                hovered_root_hwnd,
+                hovered_root.class_name if hovered_root is not None else "UnknownClass",
+                candidate.hwnd,
+                candidate.title,
+            )
+            return candidate
+
+        return hovered_root
+
+    def _iter_top_level_windows_in_z_order(self):
+        shell_window = user32.GetShellWindow()
+        hwnd = user32.GetTopWindow(0)
+        seen: set[int] = set()
+
+        while hwnd and hwnd not in seen:
+            seen.add(hwnd)
+            if hwnd != shell_window and user32.IsWindowVisible(hwnd):
+                yield hwnd
+            hwnd = user32.GetWindow(hwnd, GW_HWNDNEXT)
+
+    def _find_deepest_child_at_screen_point(self, parent_hwnd: int, screen_point: wintypes.POINT) -> int | None:
+        if not parent_hwnd or not user32.IsWindow(parent_hwnd):
+            return None
+
+        current_hwnd = parent_hwnd
+        visited = {parent_hwnd}
+        while True:
+            client_point = wintypes.POINT(screen_point.x, screen_point.y)
+            if not user32.ScreenToClient(current_hwnd, ctypes.byref(client_point)):
+                break
+
+            child_hwnd = user32.RealChildWindowFromPoint(current_hwnd, client_point)
+            if not child_hwnd or child_hwnd == current_hwnd or child_hwnd in visited or not user32.IsWindow(child_hwnd):
+                break
+
+            visited.add(child_hwnd)
+            current_hwnd = child_hwnd
+
+        if current_hwnd != parent_hwnd:
+            LOGGER.info(
+                "Point-based child resolution selected HWND %s under parent HWND %s.",
+                current_hwnd,
+                parent_hwnd,
+            )
+        return current_hwnd
+
+    def _contains_screen_point(self, hwnd: int, screen_point: wintypes.POINT) -> bool:
+        rect = wintypes.RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return False
+
+        return rect.left <= screen_point.x < rect.right and rect.top <= screen_point.y < rect.bottom
 
     def _merge_target_window(self, parent_window: TargetWindow, child_window: TargetWindow) -> TargetWindow:
         return TargetWindow(

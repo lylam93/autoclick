@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
@@ -385,11 +385,15 @@ class MainWindow(QMainWindow):
         if not isinstance(selected_window, TargetWindow):
             self._append_log("The selected row does not contain a valid window target.")
             return
-
-        self._set_target_window(selected_window)
+
+        resolved_window = self._window_service.rehydrate_target(selected_window) or selected_window
+        previous_effective_hwnd = self._config.target_window.effective_hwnd
+        self._set_target_window(resolved_window)
+        self._maybe_log_effective_target(previous_effective_hwnd, resolved_window)
         self._append_log(
-            f"Selected target window: {selected_window.title} "
-            f"(HWND={selected_window.hwnd}, Class={selected_window.class_name or '-'})"
+            f"Selected target window: {resolved_window.title} "
+            f"(HWND={resolved_window.hwnd}, Class={resolved_window.class_name or '-'}, "
+            f"Click HWND={resolved_window.effective_hwnd or '-'})"
         )
 
     def _handle_pick_window_from_cursor(self) -> None:
@@ -445,11 +449,18 @@ class MainWindow(QMainWindow):
         resolved_target = self._resolve_current_target("capturing a point")
         if resolved_target is None:
             return
-
+
         capture_result = self._window_service.capture_cursor_point(resolved_target)
         if not capture_result.success:
             self._append_log(capture_result.message)
             return
+
+        if capture_result.target_hwnd != resolved_target.effective_hwnd:
+            previous_effective_hwnd = self._config.target_window.effective_hwnd
+            refined_target = self._window_service.with_effective_hwnd(resolved_target, capture_result.target_hwnd)
+            if refined_target is not None:
+                self._set_target_window(refined_target)
+                self._maybe_log_effective_target(previous_effective_hwnd, refined_target)
 
         primary_point = self._config.points[0]
         primary_point.x = capture_result.client_x
@@ -812,6 +823,7 @@ class MainWindow(QMainWindow):
         except OSError:
             self._logger.exception("Failed to save config during shutdown.")
         super().closeEvent(event)
+
 
 
 
