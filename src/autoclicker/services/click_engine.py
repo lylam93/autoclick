@@ -1,9 +1,12 @@
 ﻿from __future__ import annotations
 
 import ctypes
+import random
+import threading
+from dataclasses import replace
 from ctypes import wintypes
 
-from autoclicker.domain.models import ClickDeliveryResult, ClickPoint, RuntimeStatus, TargetWindow
+from autoclicker.domain.models import ClickDeliveryResult, ClickPoint, ClickSettings, RuntimeStatus, TargetWindow
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 
@@ -24,29 +27,81 @@ user32.PostMessageW.restype = wintypes.BOOL
 
 
 class ClickEngine:
-    """Owns runtime state and Win32 message-based click delivery."""
+    """Owns runtime state, Win32 click delivery, and the background click loop."""
 
     def __init__(self) -> None:
         self._status = RuntimeStatus()
         self._running = False
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._worker_thread: threading.Thread | None = None
 
     @property
     def status(self) -> RuntimeStatus:
-        return self._status
+        with self._lock:
+            return replace(self._status)
 
     @property
     def is_running(self) -> bool:
-        return self._running
+        with self._lock:
+            return self._running
 
-    def start(self) -> None:
-        self._running = True
-        self._status.state = "Running"
-        self._status.last_message = "Click engine scaffold started."
+    def start_loop(
+        self,
+        target_window: TargetWindow,
+        point: ClickPoint,
+        settings: ClickSettings,
+        *,
+        use_post_message: bool = False,
+    ) -> bool:
+        target_hwnd = target_window.effective_hwnd
+        if target_hwnd is None or not user32.IsWindow(target_hwnd):
+            with self._lock:
+                self._status.state = "Error"
+                self._status.last_message = "Select a valid target window before starting the loop."
+            return False
+
+        with self._lock:
+            if self._running:
+                self._status.last_message = "Background click loop is already running."
+                return False
+
+            self._stop_event.clear()
+            self._running = True
+            self._status.state = "Running"
+            self._status.completed_clicks = 0
+            self._status.last_message = (
+                f"Background click loop started for HWND {target_hwnd} at point ({point.x}, {point.y})."
+            )
+
+            worker_target = replace(target_window)
+            worker_point = replace(point)
+            worker_settings = replace(settings)
+            self._worker_thread = threading.Thread(
+                target=self._run_loop,
+                args=(worker_target, worker_point, worker_settings, use_post_message),
+                daemon=True,
+                name="background-click-loop",
+            )
+            self._worker_thread.start()
+            return True
 
     def stop(self) -> None:
-        self._running = False
-        self._status.state = "Stopped"
-        self._status.last_message = "Click engine scaffold stopped."
+        thread_to_join: threading.Thread | None = None
+
+        with self._lock:
+            if not self._running and self._worker_thread is None:
+                self._status.state = "Stopped"
+                self._status.last_message = "Background click loop is not running."
+                return
+
+            self._stop_event.set()
+            self._status.state = "Stopping"
+            self._status.last_message = "Stopping background click loop..."
+            thread_to_join = self._worker_thread
+
+        if thread_to_join is not None and thread_to_join.is_alive() and threading.current_thread() is not thread_to_join:
+            thread_to_join.join(timeout=1.0)
 
     def send_test_click(
         self,
@@ -103,19 +158,76 @@ class ClickEngine:
             user32.SendMessageW(target_hwnd, down_message, down_wparam, lparam)
             user32.SendMessageW(target_hwnd, up_message, 0, lparam)
 
-        self._status.completed_clicks += 1
-        self._status.last_message = (
-            f"{transport_name} dispatched a {button} click to HWND {target_hwnd} "
-            f"at client point ({point.x}, {point.y})."
-        )
-        return self._build_result(
+        with self._lock:
+            self._status.completed_clicks += 1
+            self._status.last_message = (
+                f"{transport_name} dispatched a {button} click to HWND {target_hwnd} "
+                f"at client point ({point.x}, {point.y})."
+            )
+            message = self._status.last_message
+
+        return ClickDeliveryResult(
             success=True,
-            message=self._status.last_message,
-            target_window=target_window,
-            point=point,
+            message=message,
+            parent_hwnd=target_window.hwnd,
+            target_hwnd=target_window.effective_hwnd,
+            x=point.x,
+            y=point.y,
             button=button,
             used_post_message=use_post_message,
         )
+
+    def _run_loop(
+        self,
+        target_window: TargetWindow,
+        point: ClickPoint,
+        settings: ClickSettings,
+        use_post_message: bool,
+    ) -> None:
+        try:
+            while not self._stop_event.is_set():
+                result = self.send_test_click(
+                    target_window,
+                    point,
+                    button=settings.mouse_button,
+                    use_post_message=use_post_message,
+                )
+                if not result.success:
+                    with self._lock:
+                        self._status.state = "Error"
+                        self._status.last_message = result.message
+                        self._running = False
+                        self._worker_thread = None
+                    return
+
+                max_clicks = settings.max_clicks if settings.max_clicks and settings.max_clicks > 0 else None
+                if max_clicks is not None:
+                    with self._lock:
+                        completed_clicks = self._status.completed_clicks
+                    if completed_clicks >= max_clicks:
+                        with self._lock:
+                            self._status.state = "Stopped"
+                            self._status.last_message = (
+                                f"Background click loop reached the max click limit ({max_clicks})."
+                            )
+                            self._running = False
+                            self._worker_thread = None
+                        return
+
+                delay_seconds = self._next_delay_seconds(settings)
+                if self._stop_event.wait(delay_seconds):
+                    break
+        finally:
+            with self._lock:
+                if self._status.state == "Running":
+                    self._status.state = "Stopped"
+                    self._status.last_message = "Background click loop stopped."
+                elif self._status.state == "Stopping":
+                    self._status.state = "Stopped"
+                    self._status.last_message = "Background click loop stopped."
+                self._running = False
+                self._worker_thread = None
+                self._stop_event.clear()
 
     def _build_result(
         self,
@@ -127,7 +239,9 @@ class ClickEngine:
         button: str,
         used_post_message: bool,
     ) -> ClickDeliveryResult:
-        self._status.last_message = message
+        with self._lock:
+            self._status.last_message = message
+
         return ClickDeliveryResult(
             success=success,
             message=message,
@@ -147,3 +261,11 @@ class ClickEngine:
 
     def _pack_point(self, x: int, y: int) -> int:
         return ((y & 0xFFFF) << 16) | (x & 0xFFFF)
+
+    def _next_delay_seconds(self, settings: ClickSettings) -> float:
+        if settings.use_random_delay:
+            minimum = max(1, settings.random_min_ms)
+            maximum = max(1, settings.random_max_ms)
+            low, high = sorted((minimum, maximum))
+            return random.uniform(low, high) / 1000.0
+        return max(1, settings.delay_ms) / 1000.0

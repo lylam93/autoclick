@@ -2,7 +2,7 @@
 
 from dataclasses import replace
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QTimer, Qt
 from PySide6.QtWidgets import (
     QCheckBox,
     QFormLayout,
@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from autoclicker.domain.models import AppConfig, TargetWindow
+from autoclicker.domain.models import AppConfig, RuntimeStatus, TargetWindow
 from autoclicker.services.click_engine import ClickEngine
 from autoclicker.services.config_store import ConfigStore
 from autoclicker.services.hotkey_service import HotkeyService
@@ -43,6 +43,7 @@ class MainWindow(QMainWindow):
         self._hotkey_service = hotkey_service
         self._config = self._config_store.load()
         self._discovered_windows: dict[int, TargetWindow] = {}
+        self._last_terminal_message = self._click_engine.status.last_message
 
         self.setWindowTitle("Advanced Background Auto-Clicker")
         self.resize(1080, 760)
@@ -51,8 +52,10 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._populate_from_config(self._config)
         self._wire_events()
+        self._start_status_timer()
         self._append_log("Python + PySide6 scaffold is ready.")
         self._sync_runtime_status()
+        self._sync_action_states()
         self._handle_refresh_windows()
 
     def _build_ui(self) -> None:
@@ -91,7 +94,7 @@ class MainWindow(QMainWindow):
         title.setStyleSheet("font-size: 22pt; font-weight: 700; color: #f7d9aa;")
 
         subtitle = QLabel(
-            "Step 4: cursor capture now converts screen coordinates into client coordinates for the resolved click target."
+            "Step 5: the background click loop now runs in its own worker thread with stop signals, random delay, and max-click limits."
         )
         subtitle.setProperty("role", "muted")
         subtitle.setWordWrap(True)
@@ -160,7 +163,7 @@ class MainWindow(QMainWindow):
         self.capture_point_button = QPushButton("Capture Cursor Position")
 
         self.capture_hint = QLabel(
-            "Move the real cursor over the target window, then capture. The point is stored as client coordinates of the effective click HWND."
+            "Move the real cursor over the target window, then capture. Start uses the current point, delay, random range, and max-click settings shown here."
         )
         self.capture_hint.setProperty("role", "muted")
         self.capture_hint.setWordWrap(True)
@@ -255,6 +258,23 @@ class MainWindow(QMainWindow):
         self.start_button.clicked.connect(self._handle_start)
         self.stop_button.clicked.connect(self._handle_stop)
 
+    def _start_status_timer(self) -> None:
+        self._status_timer = QTimer(self)
+        self._status_timer.setInterval(200)
+        self._status_timer.timeout.connect(self._handle_status_timer)
+        self._status_timer.start()
+
+    def _handle_status_timer(self) -> None:
+        status = self._click_engine.status
+        self._sync_runtime_status(status)
+        self._sync_action_states(status)
+
+        is_busy = status.state in {"Running", "Stopping"}
+        if not is_busy and status.state in {"Stopped", "Error"} and status.last_message:
+            if status.last_message != self._last_terminal_message:
+                self._append_log(status.last_message)
+                self._last_terminal_message = status.last_message
+
     def _handle_refresh_windows(self) -> None:
         windows = self._window_service.list_windows()
         self._discovered_windows = {window.hwnd: window for window in windows if window.hwnd is not None}
@@ -262,7 +282,7 @@ class MainWindow(QMainWindow):
 
         if not windows:
             self.window_list.addItem("No visible titled windows were found.")
-            self.use_selected_window_button.setEnabled(False)
+            self._sync_action_states()
             self._append_log("Refresh complete. No visible titled windows were found.")
             return
 
@@ -280,6 +300,7 @@ class MainWindow(QMainWindow):
         if selected_item is not None:
             self.window_list.setCurrentItem(selected_item)
 
+        self._sync_action_states()
         self._append_log(f"Refresh complete. Found {len(windows)} visible titled windows.")
 
     def _handle_window_selection_changed(
@@ -287,8 +308,8 @@ class MainWindow(QMainWindow):
         current: QListWidgetItem | None,
         _previous: QListWidgetItem | None,
     ) -> None:
-        has_selection = current is not None and current.data(Qt.ItemDataRole.UserRole) is not None
-        self.use_selected_window_button.setEnabled(has_selection)
+        _ = current
+        self._sync_action_states()
 
     def _handle_window_item_double_clicked(self, _item: QListWidgetItem) -> None:
         self._handle_apply_selected_window()
@@ -311,6 +332,10 @@ class MainWindow(QMainWindow):
         )
 
     def _handle_capture_point(self) -> None:
+        if self._is_engine_busy():
+            self._append_log("Stop the running click loop before capturing a new point.")
+            return
+
         if self._config.target_window.hwnd is None:
             self._append_log("Select and apply a target window before capturing a point.")
             return
@@ -340,18 +365,15 @@ class MainWindow(QMainWindow):
         self._append_log(capture_result.message)
 
     def _handle_save_config(self) -> None:
-        self._config.click_settings.delay_ms = self.delay_spin.value()
-        self._config.click_settings.use_random_delay = self.random_delay_checkbox.isChecked()
-        self._config.click_settings.random_min_ms = self.random_min_spin.value()
-        self._config.click_settings.random_max_ms = self.random_max_spin.value()
-        self._config.click_settings.max_clicks = self.max_clicks_spin.value() or None
-        self._config.hotkeys.start_stop = self.start_stop_hotkey.text().strip() or "F8"
-        self._config.hotkeys.capture_point = self.capture_hotkey.text().strip() or "F9"
-
+        self._update_config_from_form()
         self._config_store.save(self._config)
         self._append_log(f"Configuration saved to {self._config_store.path}.")
 
     def _handle_test_background_click(self) -> None:
+        if self._is_engine_busy():
+            self._append_log("Stop the running click loop before sending a test click.")
+            return
+
         if self._config.target_window.hwnd is None:
             self._append_log("Select and apply a target window before testing background click.")
             return
@@ -380,18 +402,48 @@ class MainWindow(QMainWindow):
         self._append_log(result.message)
 
     def _handle_start(self) -> None:
-        self._click_engine.start()
+        if self._is_engine_busy():
+            self._append_log("Background click loop is already running.")
+            return
+
+        self._update_config_from_form()
+
+        if self._config.target_window.hwnd is None:
+            self._append_log("Select and apply a target window before starting the click loop.")
+            return
+
+        resolved_target = self._window_service.resolve_click_target(self._config.target_window)
+        if resolved_target is None:
+            self._append_log("The selected target window is no longer valid.")
+            return
+
+        self._set_target_window(resolved_target)
+        started = self._click_engine.start_loop(
+            resolved_target,
+            self._config.points[0],
+            self._config.click_settings,
+            use_post_message=False,
+        )
         self._sync_runtime_status()
-        self.start_button.setEnabled(False)
-        self.stop_button.setEnabled(True)
-        self._append_log(self._click_engine.status.last_message)
+        self._sync_action_states()
+
+        status = self._click_engine.status
+        if status.last_message:
+            self._append_log(status.last_message)
+            self._last_terminal_message = status.last_message
+
+        if not started:
+            return
 
     def _handle_stop(self) -> None:
         self._click_engine.stop()
         self._sync_runtime_status()
-        self.start_button.setEnabled(True)
-        self.stop_button.setEnabled(False)
-        self._append_log(self._click_engine.status.last_message)
+        self._sync_action_states()
+
+        status = self._click_engine.status
+        if status.last_message:
+            self._append_log(status.last_message)
+            self._last_terminal_message = status.last_message
 
     def _append_log(self, message: str) -> None:
         self.log_output.appendPlainText(message)
@@ -417,11 +469,39 @@ class MainWindow(QMainWindow):
     def _render_primary_point(self, x: int, y: int) -> None:
         self.primary_point_value.setText(f"({x}, {y})")
 
-    def _sync_runtime_status(self) -> None:
-        self.status_value.setText(self._click_engine.status.state)
+    def _sync_runtime_status(self, status: RuntimeStatus | None = None) -> None:
+        status = status or self._click_engine.status
+        self.status_value.setText(status.state)
         self.click_count_value.setText(
-            f"Completed clicks: {self._click_engine.status.completed_clicks}"
+            f"Completed clicks: {status.completed_clicks}"
         )
+
+    def _sync_action_states(self, status: RuntimeStatus | None = None) -> None:
+        status = status or self._click_engine.status
+        is_busy = status.state in {"Running", "Stopping"}
+        selected_item = self.window_list.currentItem()
+        has_selection = selected_item is not None and selected_item.data(Qt.ItemDataRole.UserRole) is not None
+
+        self.start_button.setEnabled(not is_busy)
+        self.stop_button.setEnabled(is_busy)
+        self.test_click_button.setEnabled(not is_busy)
+        self.capture_point_button.setEnabled(not is_busy)
+        self.save_config_button.setEnabled(not is_busy)
+        self.refresh_windows_button.setEnabled(not is_busy)
+        self.window_list.setEnabled(not is_busy)
+        self.use_selected_window_button.setEnabled(not is_busy and has_selection)
+
+    def _update_config_from_form(self) -> None:
+        self._config.click_settings.delay_ms = self.delay_spin.value()
+        self._config.click_settings.use_random_delay = self.random_delay_checkbox.isChecked()
+        self._config.click_settings.random_min_ms = self.random_min_spin.value()
+        self._config.click_settings.random_max_ms = self.random_max_spin.value()
+        self._config.click_settings.max_clicks = self.max_clicks_spin.value() or None
+        self._config.hotkeys.start_stop = self.start_stop_hotkey.text().strip() or "F8"
+        self._config.hotkeys.capture_point = self.capture_hotkey.text().strip() or "F9"
+
+    def _is_engine_busy(self) -> bool:
+        return self._click_engine.status.state in {"Running", "Stopping"}
 
     def _format_window_item(self, target_window: TargetWindow) -> str:
         class_name = target_window.class_name or "UnknownClass"
