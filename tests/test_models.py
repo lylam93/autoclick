@@ -98,6 +98,15 @@ class AppConfigModelTests(unittest.TestCase):
         self.assertEqual(payload["click_settings"]["random_min_ms"], 1)
         self.assertEqual(payload["click_settings"]["random_max_ms"], 9999)
 
+    def test_click_settings_accepts_foreground_delivery_mode(self) -> None:
+        settings = ClickSettings.from_dict(
+            {
+                "delivery_mode": "foreground",
+            }
+        )
+
+        self.assertEqual(settings.delivery_mode, "foreground")
+
 
 if __name__ == "__main__":
     unittest.main()

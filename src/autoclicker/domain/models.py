@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
@@ -8,7 +8,7 @@ from typing import Any
 TRUE_TEXTS = {"1", "true", "yes", "y", "on"}
 FALSE_TEXTS = {"0", "false", "no", "n", "off"}
 MOUSE_BUTTONS = {"left", "right"}
-DELIVERY_MODES = {"send", "post"}
+DELIVERY_MODES = {"send", "post", "foreground"}
 
 
 def _coerce_text(value: Any, default: str = "") -> str:
@@ -196,6 +196,7 @@ class ClickDeliveryResult:
     y: int = 0
     button: str = "left"
     used_post_message: bool = False
+    delivery_mode: str = "send"
 
 
 @dataclass(slots=True)
@@ -237,4 +238,3 @@ class AppConfig:
             hotkeys=HotkeySettings.from_dict(raw.get("hotkeys")),
             points=points,
         )
-

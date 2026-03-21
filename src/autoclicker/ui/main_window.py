@@ -191,6 +191,7 @@ class MainWindow(QMainWindow):
         self.delivery_mode_combo = QComboBox()
         self.delivery_mode_combo.addItem("SendMessage", "send")
         self.delivery_mode_combo.addItem("PostMessage", "post")
+        self.delivery_mode_combo.addItem("Foreground / SendInput", "foreground")
 
         self.primary_point_value = QLabel("(0, 0)")
         self.primary_point_value.setStyleSheet("font-size: 12pt; font-weight: 600;")
@@ -198,7 +199,7 @@ class MainWindow(QMainWindow):
         self.capture_point_button = QPushButton("Capture Cursor Position")
 
         delivery_hint = QLabel(
-            "SendMessage is the default path. If the target ignores it, switch to PostMessage and retest before starting a long loop."
+            "SendMessage is the default path. If the target ignores it, switch to PostMessage. For VNC or games that still ignore both, use Foreground / SendInput; it steals focus and moves the real cursor."
         )
         delivery_hint.setProperty("role", "muted")
         delivery_hint.setWordWrap(True)
@@ -271,7 +272,7 @@ class MainWindow(QMainWindow):
         layout.setSpacing(12)
 
         self.save_config_button = QPushButton("Save Config")
-        self.test_click_button = QPushButton("Test Background Click")
+        self.test_click_button = QPushButton("Test Click")
         self.start_button = QPushButton("Start")
         self.stop_button = QPushButton("Stop")
         self.stop_button.setEnabled(False)
@@ -385,7 +386,8 @@ class MainWindow(QMainWindow):
         if not isinstance(selected_window, TargetWindow):
             self._append_log("The selected row does not contain a valid window target.")
             return
-
+
+
         resolved_window = self._window_service.rehydrate_target(selected_window) or selected_window
         previous_effective_hwnd = self._config.target_window.effective_hwnd
         self._set_target_window(resolved_window)
@@ -449,7 +451,8 @@ class MainWindow(QMainWindow):
         resolved_target = self._resolve_current_target("capturing a point")
         if resolved_target is None:
             return
-
+
+
         capture_result = self._window_service.capture_cursor_point(resolved_target)
         if not capture_result.success:
             self._append_log(capture_result.message)
@@ -488,7 +491,8 @@ class MainWindow(QMainWindow):
 
         self._update_config_from_form()
         self._maybe_warn_about_default_point()
-        resolved_target = self._resolve_current_target("testing background click")
+        self._maybe_warn_about_foreground_mode()
+        resolved_target = self._resolve_current_target("testing click delivery")
         if resolved_target is None:
             return
 
@@ -497,7 +501,7 @@ class MainWindow(QMainWindow):
             resolved_target,
             point,
             button=self._config.click_settings.mouse_button,
-            use_post_message=self._current_use_post_message(),
+            delivery_mode=self._current_delivery_mode(),
         )
 
         self._sync_runtime_status()
@@ -509,11 +513,12 @@ class MainWindow(QMainWindow):
             return
 
         if self._is_engine_busy():
-            self._append_log("Background click loop is already running.")
+            self._append_log("Click loop is already running.")
             return
 
         self._update_config_from_form()
         self._maybe_warn_about_default_point()
+        self._maybe_warn_about_foreground_mode()
         resolved_target = self._resolve_current_target("starting the click loop")
         if resolved_target is None:
             return
@@ -522,7 +527,6 @@ class MainWindow(QMainWindow):
             resolved_target,
             self._config.points[0],
             self._config.click_settings,
-            use_post_message=self._current_use_post_message(),
         )
         self._sync_runtime_status()
         self._sync_action_states()
@@ -785,8 +789,14 @@ class MainWindow(QMainWindow):
             index = 0
         combo.setCurrentIndex(index)
 
-    def _current_use_post_message(self) -> bool:
-        return self._config.click_settings.delivery_mode == "post"
+    def _current_delivery_mode(self) -> str:
+        return self._config.click_settings.delivery_mode
+
+    def _maybe_warn_about_foreground_mode(self) -> None:
+        if self._current_delivery_mode() == "foreground":
+            self._append_log(
+                "Foreground / SendInput will bring the target to the front and move the real cursor while clicking."
+            )
 
     def _update_config_from_form(self) -> None:
         self._config.click_settings.delay_ms = self.delay_spin.value()
@@ -823,6 +833,9 @@ class MainWindow(QMainWindow):
         except OSError:
             self._logger.exception("Failed to save config during shutdown.")
         super().closeEvent(event)
+
+
+
 
 
 
